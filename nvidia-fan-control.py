@@ -61,6 +61,19 @@ MAX_COOLING_CURVE = [
     (0, 100),   # Always 100%
 ]
 
+# STOCK-matched curve — approximates the card's OWN factory fan curve (measured on
+# RTX PRO 6000: ~30% idle, ~44% @76°C, ~54% @88°C). Paired with sync it keeps the
+# native quiet behaviour but ties both cards together, so the ONLY change vs stock is
+# the cooler card's fan rising to match the hotter one — isolates the airflow/sync gain.
+NATIVE_CURVE = [
+    (40, 30),   # idle — matches stock
+    (60, 35),
+    (70, 41),
+    (78, 46),
+    (85, 52),
+    (90, 58),
+]
+
 
 class NvidiaFanController:
     def __init__(self, curve: List[Tuple[int, int]], poll_interval: float = 2.0,
@@ -198,9 +211,10 @@ def main():
     )
     parser.add_argument(
         "--mode", "-m",
-        choices=["quiet", "aggressive", "performance", "max"],
+        choices=["native", "quiet", "aggressive", "performance", "max"],
         default="quiet",
-        help="Fan curve mode: quiet (default), aggressive, performance, or max (100%% always)"
+        help="Fan curve: native (match stock, just sync), quiet (default), aggressive, "
+             "performance, or max (100%% always)"
     )
     parser.add_argument(
         "--interval", "-i",
@@ -223,6 +237,7 @@ def main():
     args = parser.parse_args()
     
     curves = {
+        "native": NATIVE_CURVE,
         "quiet": QUIET_CURVE,
         "aggressive": AGGRESSIVE_FAN_CURVE,
         "performance": PERFORMANCE_FAN_CURVE,
