@@ -74,6 +74,13 @@ NATIVE_CURVE = [
     (90, 58),
 ]
 
+# HARD SAFETY FLOOR — regardless of the selected curve, force 100% fan at/above this
+# temperature. Because this daemon OVERRIDES the card's own fan curve, a too-gentle
+# custom curve (e.g. 'native' tops at 58%) could otherwise leave fans low while a card
+# is dangerously hot. The GPU's own thermal throttle (~88-90°C, clocks drop) and
+# emergency shutdown (~95°C+) are the hardware backstop above this.
+CRITICAL_TEMP = 87
+
 
 class NvidiaFanController:
     def __init__(self, curve: List[Tuple[int, int]], poll_interval: float = 2.0,
@@ -155,6 +162,11 @@ class NvidiaFanController:
         # 2. in sync mode, one shared target from the hottest card
         hottest = max(temps.values())
         shared_target = self.get_fan_speed_for_temp(hottest)
+        # SAFETY FLOOR — never leave fans low when a card is dangerously hot, whatever
+        # the curve says (protects a too-gentle curve like 'native').
+        if hottest >= CRITICAL_TEMP:
+            shared_target = 100
+            log.warning(f"⚠ SAFETY: hottest={hottest}°C >= {CRITICAL_TEMP}°C -> forcing 100% fan")
 
         # 3. apply
         for gpu_idx, (handle, fan_count) in enumerate(zip(self.handles, self.fan_counts)):
@@ -162,6 +174,8 @@ class NvidiaFanController:
                 continue
             temp = temps[gpu_idx]
             target_speed = shared_target if self.sync else self.get_fan_speed_for_temp(temp)
+            if not self.sync and temp >= CRITICAL_TEMP:
+                target_speed = 100  # per-card safety floor in independent mode
             for fan_idx in range(fan_count):
                 try:
                     pynvml.nvmlDeviceSetFanSpeed_v2(handle, fan_idx, target_speed)
