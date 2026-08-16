@@ -84,13 +84,17 @@ CRITICAL_TEMP = 87
 
 class NvidiaFanController:
     def __init__(self, curve: List[Tuple[int, int]], poll_interval: float = 2.0,
-                 sync: bool = True):
+                 sync: bool = True, mirror: bool = False):
         self.curve = sorted(curve, key=lambda x: x[0])
         self.poll_interval = poll_interval
         # sync=True (default): ALL fans track the HOTTEST card ("perform as one card").
         # For back-to-back cards this stops an idle neighbour's slow fan from choking
         # the hot card's airflow. sync=False = upstream per-card independent behaviour.
         self.sync = sync
+        # mirror=True: NO custom curve at all. Keep the HOTTER card on its own factory
+        # (auto) curve, read the speed it chooses, and set the COOLER card to match.
+        # Roles swap when the temps cross. The only curve in play is the card's own.
+        self.mirror = mirror
         self.running = False
         self.handles = []
         self.fan_counts = []
@@ -112,14 +116,16 @@ class NvidiaFanController:
             
             log.info(f"  GPU {i}: {name} ({fan_count} fans)")
             
-            # Enable manual fan control for all fans
-            for fan_idx in range(fan_count):
-                try:
-                    pynvml.nvmlDeviceSetFanControlPolicy(
-                        handle, fan_idx, pynvml.NVML_FAN_POLICY_MANUAL
-                    )
-                except pynvml.NVMLError as e:
-                    log.warning(f"    Could not set manual control for fan {fan_idx}: {e}")
+            # Enable manual fan control for all fans (mirror mode manages policy
+            # per-poll instead — the hotter card stays on auto).
+            if not self.mirror:
+                for fan_idx in range(fan_count):
+                    try:
+                        pynvml.nvmlDeviceSetFanControlPolicy(
+                            handle, fan_idx, pynvml.NVML_FAN_POLICY_MANUAL
+                        )
+                    except pynvml.NVMLError as e:
+                        log.warning(f"    Could not set manual control for fan {fan_idx}: {e}")
         
         log.info(f"Fan curve: {self.curve}")
         log.info(f"Poll interval: {self.poll_interval}s")
@@ -184,6 +190,61 @@ class NvidiaFanController:
             log.info(f"GPU {gpu_idx}: {temp}°C -> {target_speed}%"
                      + (f"  [sync: hottest={hottest}°C]" if self.sync else ""))
     
+    def update_fans_mirror(self):
+        """Mirror mode: keep the HOTTER card on its own factory (auto) curve, read the
+        speed it chooses, and set the COOLER card to match — no custom curve of ours.
+        Roles swap when the temps cross. Safety floor still forces 100% above CRITICAL."""
+        temps = {}
+        for gpu_idx, handle in enumerate(self.handles):
+            try:
+                temps[gpu_idx] = pynvml.nvmlDeviceGetTemperature(
+                    handle, pynvml.NVML_TEMPERATURE_GPU)
+            except pynvml.NVMLError as e:
+                log.error(f"GPU {gpu_idx}: Error reading temperature: {e}")
+        if len(temps) < 2:
+            return  # nothing to mirror with fewer than 2 GPUs
+
+        hotter = max(temps, key=temps.get)
+        cooler = min(temps, key=temps.get)
+
+        # SAFETY FLOOR: both cards to 100% (manual) if the hotter card is critically hot
+        if temps[hotter] >= CRITICAL_TEMP:
+            for gi in (hotter, cooler):
+                for fi in range(self.fan_counts[gi]):
+                    try:
+                        pynvml.nvmlDeviceSetFanControlPolicy(self.handles[gi], fi, pynvml.NVML_FAN_POLICY_MANUAL)
+                        pynvml.nvmlDeviceSetFanSpeed_v2(self.handles[gi], fi, 100)
+                    except pynvml.NVMLError as e:
+                        log.error(f"GPU {gi} Fan {fi}: {e}")
+            log.warning(f"⚠ SAFETY: hottest={temps[hotter]}°C >= {CRITICAL_TEMP}°C -> both fans 100%")
+            return
+
+        # hotter card: back on its OWN factory curve (auto), so it picks its native speed
+        for fi in range(self.fan_counts[hotter]):
+            try:
+                pynvml.nvmlDeviceSetFanControlPolicy(
+                    self.handles[hotter], fi, pynvml.NVML_FAN_POLICY_TEMPERATURE_CONTINOUS_SW)
+            except pynvml.NVMLError as e:
+                log.error(f"GPU {hotter} Fan {fi}: {e}")
+
+        try:
+            native_fan = pynvml.nvmlDeviceGetFanSpeed_v2(self.handles[hotter], 0)
+        except pynvml.NVMLError as e:
+            log.error(f"GPU {hotter}: read fan failed: {e}")
+            return
+
+        # cooler card: manual, mirror the hotter card's native fan (never below its own —
+        # identical cards + monotonic curve mean the hotter temp always demands >= fan)
+        for fi in range(self.fan_counts[cooler]):
+            try:
+                pynvml.nvmlDeviceSetFanControlPolicy(self.handles[cooler], fi, pynvml.NVML_FAN_POLICY_MANUAL)
+                pynvml.nvmlDeviceSetFanSpeed_v2(self.handles[cooler], fi, native_fan)
+            except pynvml.NVMLError as e:
+                log.error(f"GPU {cooler} Fan {fi}: {e}")
+
+        log.info(f"mirror: GPU{hotter}(hot,auto) {temps[hotter]}°C fan={native_fan}% "
+                 f"-> GPU{cooler}(cool) {temps[cooler]}°C set {native_fan}%")
+
     def restore_auto_control(self):
         """Restore automatic fan control on all GPUs"""
         log.info("Restoring automatic fan control...")
@@ -205,7 +266,10 @@ class NvidiaFanController:
         
         try:
             while self.running:
-                self.update_fans()
+                if self.mirror:
+                    self.update_fans_mirror()
+                else:
+                    self.update_fans()
                 time.sleep(self.poll_interval)
         except KeyboardInterrupt:
             log.info("Interrupted by user")
@@ -247,6 +311,12 @@ def main():
         help="Each card follows its OWN temperature (upstream behaviour). Default is "
              "sync: every fan tracks the hottest card ('perform as one card')."
     )
+    parser.add_argument(
+        "--mirror",
+        action="store_true",
+        help="No custom curve: keep the HOTTER card on its own factory (auto) curve, read "
+             "the fan it picks, and mirror it onto the cooler card. Overrides --mode/--independent."
+    )
 
     args = parser.parse_args()
     
@@ -259,11 +329,14 @@ def main():
     }
     
     curve = curves[args.mode]
-    log.info(f"NVIDIA Fan Control - Mode: {args.mode.upper()} - "
-             f"{'INDEPENDENT (per-card)' if args.independent else 'SYNC (all fans = hottest card)'}")
+    mode_desc = ("MIRROR (hotter card's own curve, mirrored onto cooler)" if args.mirror
+                 else "INDEPENDENT (per-card)" if args.independent
+                 else "SYNC (all fans = hottest card)")
+    log.info(f"NVIDIA Fan Control - Curve: {args.mode.upper()} - {mode_desc}")
     log.info("=" * 50)
 
-    controller = NvidiaFanController(curve, args.interval, sync=not args.independent)
+    controller = NvidiaFanController(curve, args.interval,
+                                     sync=not args.independent, mirror=args.mirror)
     
     # Handle signals for clean shutdown
     def signal_handler(sig, frame):
@@ -276,7 +349,7 @@ def main():
     controller.init()
     
     if args.once:
-        controller.update_fans()
+        controller.update_fans_mirror() if args.mirror else controller.update_fans()
         log.info("Ran once. Fans will return to auto control after a few minutes.")
     else:
         controller.run()
