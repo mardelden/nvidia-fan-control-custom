@@ -63,9 +63,14 @@ MAX_COOLING_CURVE = [
 
 
 class NvidiaFanController:
-    def __init__(self, curve: List[Tuple[int, int]], poll_interval: float = 2.0):
+    def __init__(self, curve: List[Tuple[int, int]], poll_interval: float = 2.0,
+                 sync: bool = True):
         self.curve = sorted(curve, key=lambda x: x[0])
         self.poll_interval = poll_interval
+        # sync=True (default): ALL fans track the HOTTEST card ("perform as one card").
+        # For back-to-back cards this stops an idle neighbour's slow fan from choking
+        # the hot card's airflow. sync=False = upstream per-card independent behaviour.
+        self.sync = sync
         self.running = False
         self.handles = []
         self.fan_counts = []
@@ -120,31 +125,37 @@ class NvidiaFanController:
         return self.curve[-1][1]
     
     def update_fans(self):
-        """Update fan speeds for all GPUs based on current temperatures"""
-        for gpu_idx, (handle, fan_count) in enumerate(zip(self.handles, self.fan_counts)):
+        """Update fan speeds. sync=True (default): every fan on every GPU tracks the
+        HOTTEST card — coordinated cooling so back-to-back cards behave 'as one'.
+        sync=False: each card follows its own temperature (upstream behaviour)."""
+        # 1. read every GPU's temperature
+        temps = {}
+        for gpu_idx, handle in enumerate(self.handles):
             try:
-                temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
-                target_speed = self.get_fan_speed_for_temp(temp)
-                
-                current_speeds = []
-                for fan_idx in range(fan_count):
-                    try:
-                        current = pynvml.nvmlDeviceGetFanSpeed_v2(handle, fan_idx)
-                        current_speeds.append(current)
-                    except:
-                        current_speeds.append(-1)
-                
-                # Set fan speeds
-                for fan_idx in range(fan_count):
-                    try:
-                        pynvml.nvmlDeviceSetFanSpeed_v2(handle, fan_idx, target_speed)
-                    except pynvml.NVMLError as e:
-                        log.error(f"GPU {gpu_idx} Fan {fan_idx}: Error setting speed: {e}")
-                
-                log.info(f"GPU {gpu_idx}: {temp}°C -> {target_speed}% (was: {current_speeds})")
-                
+                temps[gpu_idx] = pynvml.nvmlDeviceGetTemperature(
+                    handle, pynvml.NVML_TEMPERATURE_GPU)
             except pynvml.NVMLError as e:
                 log.error(f"GPU {gpu_idx}: Error reading temperature: {e}")
+        if not temps:
+            return
+
+        # 2. in sync mode, one shared target from the hottest card
+        hottest = max(temps.values())
+        shared_target = self.get_fan_speed_for_temp(hottest)
+
+        # 3. apply
+        for gpu_idx, (handle, fan_count) in enumerate(zip(self.handles, self.fan_counts)):
+            if gpu_idx not in temps:
+                continue
+            temp = temps[gpu_idx]
+            target_speed = shared_target if self.sync else self.get_fan_speed_for_temp(temp)
+            for fan_idx in range(fan_count):
+                try:
+                    pynvml.nvmlDeviceSetFanSpeed_v2(handle, fan_idx, target_speed)
+                except pynvml.NVMLError as e:
+                    log.error(f"GPU {gpu_idx} Fan {fan_idx}: Error setting speed: {e}")
+            log.info(f"GPU {gpu_idx}: {temp}°C -> {target_speed}%"
+                     + (f"  [sync: hottest={hottest}°C]" if self.sync else ""))
     
     def restore_auto_control(self):
         """Restore automatic fan control on all GPUs"""
@@ -202,7 +213,13 @@ def main():
         action="store_true",
         help="Set fans once and exit (don't run as daemon)"
     )
-    
+    parser.add_argument(
+        "--independent",
+        action="store_true",
+        help="Each card follows its OWN temperature (upstream behaviour). Default is "
+             "sync: every fan tracks the hottest card ('perform as one card')."
+    )
+
     args = parser.parse_args()
     
     curves = {
@@ -213,10 +230,11 @@ def main():
     }
     
     curve = curves[args.mode]
-    log.info(f"NVIDIA Fan Control - Mode: {args.mode.upper()}")
+    log.info(f"NVIDIA Fan Control - Mode: {args.mode.upper()} - "
+             f"{'INDEPENDENT (per-card)' if args.independent else 'SYNC (all fans = hottest card)'}")
     log.info("=" * 50)
-    
-    controller = NvidiaFanController(curve, args.interval)
+
+    controller = NvidiaFanController(curve, args.interval, sync=not args.independent)
     
     # Handle signals for clean shutdown
     def signal_handler(sig, frame):
