@@ -15,8 +15,10 @@ A single Python daemon that does two related things on a multi-GPU host:
 1. **Fan control** — overrides the cards' factory fan curve; can sync all fans to the
    hottest card (matters for back-to-back cards where an idle neighbour's slow fan
    chokes the hot card's airflow).
-2. **Power governor** *(fork addition, optional)* — closed-loop cap on **total UPS
-   load** by adjusting GPU power limits.
+2. **Power governor** *(fork addition, optional)* — **reactive** closed-loop cap on
+   **total UPS load** by adjusting GPU power limits: full power until load *sustains*
+   over budget, then throttle; a brief spike passes through (the UPS carries a few
+   seconds of overshoot on surge/battery).
 
 They share one process deliberately: capping power lowers temperature, so two
 independent controllers would react to each other's output.
@@ -110,15 +112,19 @@ number, and a host with no UPS should not enable the governor at all.
   `ups.load` as an **integer percent** of nominal, refreshed every ~2 s. Watts are
   derived at **10 W resolution**, and **sub-2 s transients are invisible**. This
   governs sustained draw; it is *not* inrush protection.
-- **The governor is a permanent ceiling, not an emergency brake.** On a host whose
-  peak draw exceeds the budget, it is active whenever the GPUs work. On the dev box a
-  900 W budget yields ~355 W/GPU at CPU idle and ~210 W/GPU under full CPU load,
-  against a 600 W rating — a real throughput cost, chosen deliberately because the
-  1000 W UPS cannot carry the machine at full tilt.
-- **Only validated at idle so far.** Convergence (600 → 450 → 366, then steady) was
-  measured with GPUs at 0% utilization. Behaviour under sustained inference load is
-  modelled, not observed. **Validate with `--power-dry-run` under real load before
-  enabling for real on any host.**
+- **Reactive, not a permanent ceiling (changed 2026-08-20).** The governor leaves the
+  GPUs at their MAX limit while the UPS has headroom, and only throttles once total load
+  *sustains* over budget (past a ~1-interval grace, so a brief spike passes through — the
+  UPS carries a few seconds of overshoot on surge/battery). So there is **no throughput
+  cost at idle or moderate load** (an idle dry-run holds 600 W/GPU). Only under a sustained
+  overload does it trim toward `(budget − non_gpu)/n_gpus` — down fast (150 W/tick), back up
+  gently (40 W/tick). Grace and restore-margin are tunable (`POWER_OVER_GRACE_TICKS`,
+  `POWER_RESTORE_MARGIN_W`). The earlier proactive law pre-capped every GPU even at idle.
+- **Idle-validated; under-load is modelled.** The reactive idle case is confirmed — it
+  holds 600 W/GPU with total ~190 W ≪ 900 W budget (no throttle). The throttle path
+  (sustained overshoot → trim to fit ~budget) is reasoned, not yet measured. **Validate
+  with `--power-dry-run` under real GPU load before enabling on any host** — confirm a
+  sustained overload converges to ~budget and a brief spike is *not* throttled.
 - **Other devices on the same UPS are included in the budget.** This is intentional —
   the thing being protected is the UPS. But it means unrelated load silently reduces
   GPU headroom, which can look like an unexplained throttle.

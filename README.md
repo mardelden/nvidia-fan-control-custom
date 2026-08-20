@@ -219,10 +219,16 @@ from the fan loop and self-rate-limits to `--power-interval` (default 5 s).
 
 ### Control law
 
+**Reactive** — GPUs stay at their MAX limit while the UPS has headroom; the ceiling drops
+only once load *sustains* over budget (a brief spike passes through untouched, held for a
+grace of `POWER_OVER_GRACE_TICKS` updates). Earlier revisions capped proactively even at
+idle; changed to reactive 2026-08-20.
+
 ```
 non_gpu  = total_ups_watts − Σ(gpu power draw)
-headroom = budget − non_gpu
-per_gpu  = clamp(headroom / n_gpus, hw_min, hw_max)
+over budget >= GRACE ticks  ->  throttle toward (budget - non_gpu) / n_gpus
+comfortably under budget    ->  restore toward hw_max
+brief spike / steady band   ->  hold
 ```
 
 Attributing the remainder to `non_gpu` instead of modelling the CPU means the loop
@@ -240,7 +246,9 @@ constant, so a naive proportional loop hunts. Three guards:
 | Slew down | 150 W/step | react fast in the safe direction |
 | Slew up | 40 W/step | recover gently, never overshoot the budget |
 
-Observed convergence at a 900 W budget: `600 → 450 → 366`, then steady.
+Reactive behaviour at a 900 W budget: idle holds `600/600` (total ~190 W ≪ budget, no
+throttle); a sustained overload trims down 150 W/step until total settles at ~budget, then
+recovers 40 W/step as load falls. A brief spike is held (grace) and passes through.
 
 ### Safety behaviour
 

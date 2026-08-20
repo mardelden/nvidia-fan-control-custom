@@ -107,6 +107,13 @@ POWER_DEADBAND_W = 15               # ignore changes smaller than this
 POWER_SLEW_DOWN_W = 150             # max decrease per update (react fast)
 POWER_SLEW_UP_W = 40                # max increase per update (recover gently)
 
+# Reactive law: leave GPUs at MAX while the UPS has headroom; only throttle once load
+# SUSTAINS over budget. A brief spike (even above nominal — the UPS carries it on
+# surge/battery for a few seconds) passes untouched until the overage persists this many
+# consecutive updates. Restore toward MAX only once comfortably back under budget (hysteresis).
+POWER_OVER_GRACE_TICKS = 2          # ~one update interval of overshoot allowed before throttling
+POWER_RESTORE_MARGIN_W = 50         # only restore toward MAX when this far under budget
+
 # Fail-safe: if the UPS can't be read this many times in a row we are flying blind,
 # so clamp to a conservative per-GPU limit rather than assuming headroom.
 POWER_MAX_READ_FAILURES = 3
@@ -166,17 +173,27 @@ class UpsReader:
 
 
 class PowerGovernor:
-    """Keeps TOTAL UPS load under `budget` by capping GPU power limits.
+    """Keeps TOTAL UPS load under `budget` by capping GPU power limits — REACTIVELY.
+
+    The GPUs run at their MAX limit whenever the UPS has headroom; the ceiling is
+    pulled down only once load actually SUSTAINS over budget (past a short grace, so a
+    brief spike — which the UPS carries on surge/battery for a few seconds — passes
+    through untouched). Trades a small bounded overshoot for full GPU throughput
+    whenever the UPS isn't genuinely stressed.
 
     Control law each tick:
-        non_gpu   = total_ups_watts - sum(gpu draw)
-        headroom  = budget - non_gpu
-        per_gpu   = clamp(headroom / n_gpus, hw_min, hw_max)
-    then deadband + asymmetric slew limiting before it is applied.
+        non_gpu = total_ups_watts - sum(gpu draw)
+        over budget for >= GRACE ticks  -> throttle toward (budget - non_gpu)/n_gpus
+        comfortably under budget        -> restore toward hw_max
+        brief overshoot / steady band   -> hold
+    then deadband + asymmetric slew (down fast, up gently) before it is applied.
 
-    Attributing the remainder to `non_gpu` rather than modelling the CPU means the
-    loop is correct even if OTHER devices share the UPS — which is what we want,
-    since the thing being protected is the UPS, not the server.
+    (Earlier revisions used a PROACTIVE law — per_gpu = (budget-non_gpu)/n EVERY tick —
+    which pre-capped the GPUs even at idle. Changed to reactive per operator 2026-08-20:
+    brief overshoots are acceptable, only sustained ones warrant a throttle.)
+
+    Attributing the remainder to `non_gpu` rather than modelling the CPU means the loop
+    is correct even if OTHER devices share the UPS — the thing protected is the UPS.
     """
 
     def __init__(self, handles: List, budget_w: float = DEFAULT_POWER_BUDGET,
@@ -196,6 +213,7 @@ class PowerGovernor:
         self.applied_w: List[float] = []
         self._last_run = 0.0
         self._was_on_battery = False
+        self._over_ticks = 0
 
     def init(self):
         for i, h in enumerate(self.handles):
@@ -263,8 +281,30 @@ class PowerGovernor:
                 return
 
         non_gpu = max(0.0, total_w - gpu_draw)
-        headroom = self.budget_w - non_gpu
-        target = headroom / max(1, len(self.handles))
+
+        # ── REACTIVE: only pull the ceiling down when load SUSTAINS over budget ──
+        over = total_w - self.budget_w
+        if over > POWER_DEADBAND_W:
+            self._over_ticks += 1
+            if self._over_ticks < POWER_OVER_GRACE_TICKS:
+                log.info(f"POWER: ups={total_w:.0f}W over budget {self.budget_w:.0f}W by "
+                         f"{over:.0f}W (grace {self._over_ticks}/{POWER_OVER_GRACE_TICKS}) — "
+                         "letting it pass, limits held "
+                         + "/".join(f"{w:.0f}" for w in self.applied_w) + "W")
+                return
+            # sustained over budget → shed the excess so total settles at ~budget
+            target = (self.budget_w - non_gpu) / max(1, len(self.handles))
+            mode = "throttle"
+        else:
+            self._over_ticks = 0
+            if total_w < self.budget_w - POWER_RESTORE_MARGIN_W:
+                target = max(self.max_w)          # headroom → run free (per-GPU clamp below)
+                mode = "restore"
+            else:
+                log.info(f"POWER: ups={total_w:.0f}W gpu={gpu_draw:.0f}W other={non_gpu:.0f}W "
+                         f"budget={self.budget_w:.0f}W -> steady, limits held "
+                         + "/".join(f"{w:.0f}" for w in self.applied_w) + "W")
+                return
 
         for i in range(len(self.handles)):
             cur = self.applied_w[i]
@@ -279,7 +319,7 @@ class PowerGovernor:
             self._set_limit(i, want)
 
         log.info(f"POWER: ups={total_w:.0f}W gpu={gpu_draw:.0f}W other={non_gpu:.0f}W "
-                 f"budget={self.budget_w:.0f}W -> limits="
+                 f"budget={self.budget_w:.0f}W -> {mode} "
                  + "/".join(f"{w:.0f}" for w in self.applied_w) + "W")
 
     def restore_defaults(self):
