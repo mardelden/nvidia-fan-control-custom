@@ -107,12 +107,13 @@ POWER_DEADBAND_W = 15               # ignore changes smaller than this
 POWER_SLEW_DOWN_W = 150             # max decrease per update (react fast)
 POWER_SLEW_UP_W = 40                # max increase per update (recover gently)
 
-# Reactive law: leave GPUs at MAX while the UPS has headroom; only throttle once load
-# SUSTAINS over budget. A brief spike (even above nominal — the UPS carries it on
-# surge/battery for a few seconds) passes untouched until the overage persists this many
-# consecutive updates. Restore toward MAX only once comfortably back under budget (hysteresis).
-POWER_OVER_GRACE_TICKS = 2          # ~one update interval of overshoot allowed before throttling
-POWER_RESTORE_MARGIN_W = 50         # only restore toward MAX when this far under budget
+# Reactive law: leave GPUs at MAX while the UPS has headroom; throttle once load goes over
+# budget. Default reacts on the FIRST over-budget tick (grace=1, the minimum). A truly brief
+# spike still passes: the UPS sensor is ~2 s coarse so a sub-2 s transient never registers, and
+# the down-slew is bounded (150 W/tick), so the first throttle step is gentle regardless. Raise
+# POWER_OVER_GRACE_TICKS to also ride out LONGER sustained overshoots before reacting.
+POWER_OVER_GRACE_TICKS = 1          # throttle on the first over-budget tick (min; sub-2s spikes pass via sensor coarseness)
+POWER_RESTORE_MARGIN_W = 50         # only restore toward MAX when this far under budget (hysteresis)
 
 # Fail-safe: if the UPS can't be read this many times in a row we are flying blind,
 # so clamp to a conservative per-GPU limit rather than assuming headroom.
@@ -176,10 +177,11 @@ class PowerGovernor:
     """Keeps TOTAL UPS load under `budget` by capping GPU power limits — REACTIVELY.
 
     The GPUs run at their MAX limit whenever the UPS has headroom; the ceiling is
-    pulled down only once load actually SUSTAINS over budget (past a short grace, so a
-    brief spike — which the UPS carries on surge/battery for a few seconds — passes
-    through untouched). Trades a small bounded overshoot for full GPU throughput
-    whenever the UPS isn't genuinely stressed.
+    pulled down as soon as load goes over budget (on the FIRST over-budget tick by
+    default — POWER_OVER_GRACE_TICKS raises that to ride out longer overshoots). A
+    truly brief spike still passes: the ~2 s coarse UPS sensor can't see a sub-2 s
+    transient and the down-slew is bounded. Trades a small bounded overshoot for full
+    GPU throughput whenever the UPS isn't genuinely stressed.
 
     Control law each tick:
         non_gpu = total_ups_watts - sum(gpu draw)

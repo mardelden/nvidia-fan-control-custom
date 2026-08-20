@@ -114,8 +114,9 @@ number, and a host with no UPS should not enable the governor at all.
   governs sustained draw; it is *not* inrush protection.
 - **Reactive, not a permanent ceiling (changed 2026-08-20).** The governor leaves the
   GPUs at their MAX limit while the UPS has headroom, and only throttles once total load
-  *sustains* over budget (past a ~1-interval grace, so a brief spike passes through — the
-  UPS carries a few seconds of overshoot on surge/battery). So there is **no throughput
+  goes over budget — on the FIRST over-budget tick (grace=1). A truly brief spike still passes:
+  the ~2 s coarse UPS sensor can't see a sub-2 s transient, and the UPS rides a few seconds of
+  overshoot on surge/battery anyway (raise `POWER_OVER_GRACE_TICKS` to ride out longer ones). So there is **no throughput
   cost at idle or moderate load** (an idle dry-run holds 600 W/GPU). Only under a sustained
   overload does it trim toward `(budget − non_gpu)/n_gpus` — down fast (150 W/tick), back up
   gently (40 W/tick). Grace and restore-margin are tunable (`POWER_OVER_GRACE_TICKS`,
