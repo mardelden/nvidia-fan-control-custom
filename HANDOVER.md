@@ -71,6 +71,7 @@ nothing to put in OpenBao.
 | `--ups NAME` | `cyberpower` | NUT UPS name — `upsc -l` |
 | `--power-interval` | `5.0` | governor period; below ~2 s buys nothing |
 | `--power-fallback` | `300` | per-GPU clamp when the UPS is unreadable |
+| `--power-floor-on FLAG[,FLAG...]` | `OB,LB` | statuses that immediately use hardware floor |
 | `--power-dry-run` | off | log only, change nothing |
 
 **The governor is off unless `--power-budget` is passed.** Hosts without a UPS run
@@ -79,7 +80,7 @@ exactly as before.
 Reference invocation (dev box, pve-ai):
 
 ```
---mode quiet --interval 1 --power-budget 900
+--mode quiet --interval 1 --power-budget 900 --power-floor-on OB
 ```
 
 ## Per-host values that must NOT be copied blindly
@@ -98,7 +99,7 @@ number, and a host with no UPS should not enable the governor at all.
 
 | Condition | Action |
 |---|---|
-| `ups.status` contains `OB` or `LB` (**on battery**) | clamp all GPUs to the hardware floor (150 W on RTX PRO 6000) — runtime beats throughput during an outage |
+| `ups.status` matches `--power-floor-on` | clamp all GPUs to the hardware floor (150 W on RTX PRO 6000); default `OB,LB` |
 | UPS unreadable 3× consecutively | clamp to `--power-fallback` rather than assume headroom |
 | Daemon exits / restarts | restores each GPU's **factory default** power limit and auto fan policy |
 | GPU ≥ 87 °C | fan safety floor forces 100%, independent of the curve |
@@ -120,12 +121,20 @@ number, and a host with no UPS should not enable the governor at all.
   cost at idle or moderate load** (an idle dry-run holds 600 W/GPU). Only under a sustained
   overload does it trim toward `(budget − non_gpu)/n_gpus` — down fast (150 W/tick), back up
   gently (40 W/tick). Grace and restore-margin are tunable (`POWER_OVER_GRACE_TICKS`,
-  `POWER_RESTORE_MARGIN_W`). The earlier proactive law pre-capped every GPU even at idle.
-- **Idle-validated; under-load is modelled.** The reactive idle case is confirmed — it
-  holds 600 W/GPU with total ~190 W ≪ 900 W budget (no throttle). The throttle path
-  (sustained overshoot → trim to fit ~budget) is reasoned, not yet measured. **Validate
-  with `--power-dry-run` under real GPU load before enabling on any host** — confirm a
-  sustained overload converges to ~budget and a brief spike is *not* throttled.
+  `POWER_RESTORE_MARGIN_W`). The final recovery step snaps exactly to hardware max; the 15 W
+  deadband cannot strand a 600 W card at 590 W. The earlier proactive law pre-capped every GPU
+  even at idle.
+- **Live-load validated on pve-ai (2026-08-20).** Qwen3.8 on one GPU plus a bounded CPU probe
+  reached 1050 W while the UPS remained online. The normal reactive path cut both card limits
+  `590 → 440 → 290 → 150 W` across three 5-second ticks. Larger probes asserted `OL LB` while
+  the UPS still reported online; no `OB` transition was captured. Floor-trigger flags are now
+  configurable. pve-ai uses `--power-floor-on OB`, so `OL LB` remains in the ordinary 900 W
+  reactive budget loop while a real `OB` status still floors immediately.
+- **Throttle steps wait for fresh UPS feedback.** After reducing all GPU limits, the governor
+  holds them until either `ups.load` or `ups.status` changes. pve-ai's CyberPower cached 1030 W
+  for 36 seconds after CPU load stopped; acting repeatedly on that value drove limits to 150 W.
+  A 45-second timeout permits another step if the sensor is genuinely stuck during an overload.
+  Emergency floor flags bypass this gate. All GPUs still receive the same limit.
 - **Other devices on the same UPS are included in the budget.** This is intentional —
   the thing being protected is the UPS. But it means unrelated load silently reduces
   GPU headroom, which can look like an unexplained throttle.

@@ -120,9 +120,28 @@ POWER_RESTORE_MARGIN_W = 50         # only restore toward MAX when this far unde
 POWER_MAX_READ_FAILURES = 3
 DEFAULT_POWER_FALLBACK_W = 300      # per-GPU limit when the sensor is unavailable
 
-# NUT ups.status flags that mean "not on mains". On battery we clamp to the floor:
-# runtime matters far more than throughput during an outage.
-ON_BATTERY_FLAGS = ("OB", "LB")
+# After a downward limit step, do not act again on the same cached UPS sample.
+# pve-ai's CyberPower held a stale 1030 W value for 36 s after load disappeared;
+# without this gate, falling GPU draw was misattributed as rising non-GPU load.
+POWER_FEEDBACK_TIMEOUT_S = 45.0
+
+# NUT ups.status flags that immediately clamp GPUs to their hardware floor.
+# Conservative default preserves the original behavior; hosts can configure only
+# OB when LB merely reflects low estimated runtime while the UPS remains OL.
+DEFAULT_POWER_FLOOR_FLAGS = ("OB", "LB")
+
+
+def parse_power_floor_flags(value: str) -> Tuple[str, ...]:
+    """Parse a comma-separated, non-empty set of NUT ups.status tokens."""
+    flags = tuple(dict.fromkeys(part.strip().upper() for part in value.split(",")
+                                if part.strip()))
+    if not flags:
+        raise argparse.ArgumentTypeError("expected at least one NUT status flag (for example: OB)")
+    invalid = [flag for flag in flags if not flag.isalpha()]
+    if invalid:
+        raise argparse.ArgumentTypeError(
+            "NUT status flags must contain letters only: " + ",".join(invalid))
+    return flags
 
 
 class UpsReader:
@@ -130,8 +149,8 @@ class UpsReader:
 
     This UPS (CyberPower CP1500PFCLCDa) does NOT expose `ups.realpower`, only
     `ups.load` as an integer percent of `ups.realpower.nominal` — so watts are
-    derived, with nominal/100 resolution. `ups.status` is used to detect a mains
-    outage (`OB` = on battery, `LB` = low battery).
+    derived, with nominal/100 resolution. The raw `ups.status` tokens are returned
+    to the governor, which decides which configured flags require an immediate floor.
     """
 
     def __init__(self, ups_name: str = DEFAULT_UPS_NAME):
@@ -151,8 +170,8 @@ class UpsReader:
                 vars_[k.strip()] = v.strip()
         return vars_
 
-    def read(self) -> Optional[Tuple[float, bool]]:
-        """Return (total_watts, on_battery) or None if the UPS can't be read."""
+    def read(self) -> Optional[Tuple[float, Tuple[str, ...]]]:
+        """Return (total_watts, status_flags) or None if the UPS can't be read."""
         try:
             v = self._upsc()
             if self.nominal_w is None:
@@ -161,12 +180,11 @@ class UpsReader:
                     log.info(f"UPS '{self.ups_name}': {v.get('ups.model','?')} "
                              f"nominal={self.nominal_w} W")
             load_pct = float(v["ups.load"])
-            status = v.get("ups.status", "")
-            on_battery = any(f in status.split() for f in ON_BATTERY_FLAGS)
+            status_flags = tuple(v.get("ups.status", "").split())
             if not self.nominal_w:
                 raise ValueError("ups.realpower.nominal missing/zero")
             self.consecutive_failures = 0
-            return (load_pct * self.nominal_w / 100.0, on_battery)
+            return (load_pct * self.nominal_w / 100.0, status_flags)
         except Exception as e:
             self.consecutive_failures += 1
             log.error(f"UPS read failed ({self.consecutive_failures}): {e}")
@@ -202,11 +220,13 @@ class PowerGovernor:
                  ups_name: str = DEFAULT_UPS_NAME,
                  interval: float = DEFAULT_POWER_INTERVAL,
                  fallback_w: float = DEFAULT_POWER_FALLBACK_W,
+                 floor_on_flags: Tuple[str, ...] = DEFAULT_POWER_FLOOR_FLAGS,
                  dry_run: bool = False):
         self.handles = handles
         self.budget_w = budget_w
         self.interval = interval
         self.fallback_w = fallback_w
+        self.floor_on_flags = tuple(flag.upper() for flag in floor_on_flags)
         self.dry_run = dry_run
         self.ups = UpsReader(ups_name)
         self.min_w: List[float] = []
@@ -214,8 +234,11 @@ class PowerGovernor:
         self.default_w: List[float] = []
         self.applied_w: List[float] = []
         self._last_run = 0.0
-        self._was_on_battery = False
+        self._was_power_floor = False
         self._over_ticks = 0
+        self._feedback_wait_total_w: Optional[float] = None
+        self._feedback_wait_status_flags: Tuple[str, ...] = ()
+        self._feedback_wait_since = 0.0
 
     def init(self):
         for i, h in enumerate(self.handles):
@@ -230,6 +253,7 @@ class PowerGovernor:
                      f"(default {self.default_w[i]:.0f} W, now {self.applied_w[i]:.0f} W)")
         log.info(f"Power budget: {self.budget_w:.0f} W total UPS load"
                  + ("  [DRY RUN — nothing will be set]" if self.dry_run else ""))
+        log.info("Immediate power-floor UPS flags: " + ",".join(self.floor_on_flags))
 
     def _set_limit(self, idx: int, watts: float):
         watts = max(self.min_w[idx], min(self.max_w[idx], watts))
@@ -262,17 +286,47 @@ class PowerGovernor:
                 self.clamp_all(self.fallback_w,
                                f"UPS unreadable x{self.ups.consecutive_failures} (flying blind)")
             return
-        total_w, on_battery = reading
+        total_w, status_flags = reading
+        matched_floor_flags = [flag for flag in self.floor_on_flags if flag in status_flags]
 
-        # ── mains lost: runtime beats throughput, floor the cards immediately ──
-        if on_battery:
-            if not self._was_on_battery:
-                self.clamp_all(min(self.min_w), "ON BATTERY — maximising runtime")
-                self._was_on_battery = True
+        # ── configured UPS emergency: runtime beats throughput, floor immediately ──
+        if matched_floor_flags:
+            if not self._was_power_floor:
+                status = " ".join(status_flags) or "(empty)"
+                matched = ",".join(matched_floor_flags)
+                self.clamp_all(min(self.min_w),
+                               f"UPS status {status} matched floor-on {matched}")
+                self._was_power_floor = True
+            self._feedback_wait_total_w = None
             return
-        if self._was_on_battery:
-            log.info("Mains restored — resuming normal power governing")
-            self._was_on_battery = False
+        if self._was_power_floor:
+            status = " ".join(status_flags) or "(empty)"
+            log.info(f"UPS power-floor condition cleared (status {status}) — "
+                     "resuming normal power governing")
+            self._was_power_floor = False
+
+        # A power-limit change and the UPS reading are asynchronous. Hold after
+        # every downward step until NUT publishes a different load/status sample;
+        # otherwise a cached total plus falling GPU draw invents rising non-GPU load.
+        if self._feedback_wait_total_w is not None:
+            old_total = self._feedback_wait_total_w
+            old_status = self._feedback_wait_status_flags
+            elapsed = now - self._feedback_wait_since
+            if total_w != old_total or status_flags != old_status:
+                log.info(f"POWER: fresh UPS feedback after throttle: {old_total:.0f}W/"
+                         f"{' '.join(old_status)} -> {total_w:.0f}W/"
+                         f"{' '.join(status_flags)}")
+                self._feedback_wait_total_w = None
+            elif elapsed < POWER_FEEDBACK_TIMEOUT_S:
+                log.info(f"POWER: ups={total_w:.0f}W status={' '.join(status_flags)} — "
+                         f"awaiting fresh feedback after throttle "
+                         f"({elapsed:.0f}/{POWER_FEEDBACK_TIMEOUT_S:.0f}s), limits held "
+                         + "/".join(f"{w:.0f}" for w in self.applied_w) + "W")
+                return
+            else:
+                log.warning(f"⚠ POWER: no fresh UPS feedback for {elapsed:.0f}s; "
+                            "allowing another throttle decision")
+                self._feedback_wait_total_w = None
 
         gpu_draw = 0.0
         for i, h in enumerate(self.handles):
@@ -308,17 +362,32 @@ class PowerGovernor:
                          + "/".join(f"{w:.0f}" for w in self.applied_w) + "W")
                 return
 
+        limits_before = tuple(self.applied_w)
         for i in range(len(self.handles)):
             cur = self.applied_w[i]
             want = max(self.min_w[i], min(self.max_w[i], target))
             delta = want - cur
             if abs(delta) < POWER_DEADBAND_W:
+                # The deadband suppresses limit hunting, but a restore target is an
+                # exact hardware state, not a noisy sensor reading. Without this
+                # final snap, a 40 W up-slew from a 150 W floor stops permanently
+                # at 590 W on a 600 W card because the last 10 W is inside the
+                # 15 W deadband.
+                if mode == "restore" and delta > 0 and want == self.max_w[i]:
+                    self._set_limit(i, want)
                 continue
             if delta < 0:
                 want = cur - min(-delta, POWER_SLEW_DOWN_W)
             else:
                 want = cur + min(delta, POWER_SLEW_UP_W)
             self._set_limit(i, want)
+
+        if mode == "throttle" and tuple(self.applied_w) != limits_before:
+            self._feedback_wait_total_w = total_w
+            self._feedback_wait_status_flags = status_flags
+            self._feedback_wait_since = now
+            log.info(f"POWER: throttle step applied; awaiting fresh UPS feedback "
+                     f"(timeout {POWER_FEEDBACK_TIMEOUT_S:.0f}s)")
 
         log.info(f"POWER: ups={total_w:.0f}W gpu={gpu_draw:.0f}W other={non_gpu:.0f}W "
                  f"budget={self.budget_w:.0f}W -> {mode} "
@@ -607,6 +676,14 @@ def main():
              f"(default: {DEFAULT_POWER_FALLBACK_W:.0f} W)"
     )
     parser.add_argument(
+        "--power-floor-on",
+        type=parse_power_floor_flags,
+        default=DEFAULT_POWER_FLOOR_FLAGS,
+        metavar="FLAG[,FLAG...]",
+        help="Comma-separated NUT ups.status flags that immediately clamp every GPU "
+             "to its hardware floor (default: OB,LB; use OB to ignore LB while online)"
+    )
+    parser.add_argument(
         "--power-dry-run",
         action="store_true",
         help="Power governor logs what it WOULD set without touching the GPUs. "
@@ -644,9 +721,11 @@ def main():
             ups_name=args.ups,
             interval=args.power_interval,
             fallback_w=args.power_fallback,
+            floor_on_flags=args.power_floor_on,
             dry_run=args.power_dry_run,
         )
-        log.info(f"Power governor ENABLED — budget {args.power_budget:.0f} W via UPS '{args.ups}'")
+        log.info(f"Power governor ENABLED — budget {args.power_budget:.0f} W via UPS '{args.ups}', "
+                 f"floor-on={','.join(args.power_floor_on)}")
 
     controller = NvidiaFanController(curve, args.interval,
                                      sync=not args.independent, mirror=args.mirror,

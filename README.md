@@ -156,6 +156,7 @@ python3 nvidia-fan-control.py --help
 | `--mode`, `-m` | Fan curve mode: `quiet` (default), `aggressive`, `performance`, or `max` |
 | `--interval`, `-i` | Poll interval in seconds (default: 2.0) |
 | `--once` | Set fans once and exit (don't run as daemon) |
+| `--power-floor-on FLAG[,FLAG...]` | NUT statuses that immediately use the GPU hardware floor |
 
 ## Uninstall
 
@@ -249,13 +250,21 @@ constant, so a naive proportional loop hunts. Three guards:
 
 Reactive behaviour at a 900 W budget: idle holds `600/600` (total ~190 W ≪ budget, no
 throttle); a sustained overload trims down 150 W/step until total settles at ~budget, then
-recovers 40 W/step as load falls. A truly brief spike passes through — it's below the ~2 s sensor's resolution.
+recovers 40 W/step as load falls. The final restore step snaps exactly to hardware max, so the
+15 W deadband cannot strand a 600 W card at 590 W. A truly brief spike passes through — it's below
+the ~2 s sensor's resolution.
+
+After each downward step, the governor holds all GPU limits until NUT publishes a different
+`ups.load` or `ups.status` sample. This prevents a cached UPS total from turning falling GPU draw
+into falsely rising inferred non-GPU load. An unchanged sample is accepted after 45 seconds so a
+stuck sensor cannot freeze protection indefinitely. Emergency `--power-floor-on` flags bypass the
+wait. The same limit is still applied to every GPU.
 
 ### Safety behaviour
 
 | Condition | Action |
 |---|---|
-| `ups.status` contains `OB`/`LB` (**on battery**) | clamp both GPUs to the hardware floor (150 W) — runtime beats throughput during an outage |
+| `ups.status` matches `--power-floor-on` | clamp both GPUs to the hardware floor (150 W); default `OB,LB` |
 | UPS unreadable ×3 | clamp to `--power-fallback` (default 300 W) rather than assume headroom |
 | Daemon exit | restore each GPU's factory default power limit |
 
@@ -277,4 +286,5 @@ This governs *sustained* draw. It is not inrush protection.
 | `--ups NAME` | `cyberpower` | NUT name, see `upsc -l` |
 | `--power-interval SEC` | `5.0` | below ~2 s buys nothing |
 | `--power-fallback WATTS` | `300` | per-GPU clamp when the sensor dies |
+| `--power-floor-on FLAG[,FLAG...]` | `OB,LB` | statuses that immediately use hardware floor |
 | `--power-dry-run` | off | log only, change nothing |
