@@ -10,10 +10,11 @@ Or install as a systemd service
 import pynvml
 import time
 import signal
+import subprocess
 import sys
 import argparse
 import logging
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # Configure logging for systemd journal
 logging.basicConfig(
@@ -82,9 +83,220 @@ NATIVE_CURVE = [
 CRITICAL_TEMP = 87
 
 
+# ─────────────────────────── POWER GOVERNOR ───────────────────────────
+# Closed-loop whole-server power cap. The UPS is the sensor (it is the only thing
+# that sees TOTAL draw, including CPU/board/disks) and the GPU power limit is the
+# actuator. Goal: keep total UPS load under budget so the UPS can actually carry
+# the machine, instead of tripping on overload.
+#
+# Measured baseline on pve-ai (CyberPower CP1500PFCLCDa, ups.realpower.nominal=1000):
+#   idle total ~220 W with GPUs at ~16 W each  ->  non-GPU floor ~190 W
+#   Threadripper 7970X peaks ~355 W, so non-GPU can reach ~480 W under CPU load.
+# With a 900 W budget that leaves 420-710 W to split across the GPUs.
+
+# UPS load is reported as INTEGER PERCENT of ups.realpower.nominal, so resolution
+# is nominal/100 (10 W on a 1000 W unit). Do not expect finer control than that.
+DEFAULT_POWER_BUDGET = 900          # watts, total UPS load ceiling
+DEFAULT_UPS_NAME = "cyberpower"     # `upsc -l` name
+DEFAULT_POWER_INTERVAL = 5.0        # seconds between governor updates
+
+# Anti-oscillation. The UPS driver polls every ~2 s and NVML's own enforcement has
+# its own time constant, so a naive proportional loop will hunt. Asymmetric slew:
+# come DOWN fast (safe direction), go UP slowly.
+POWER_DEADBAND_W = 15               # ignore changes smaller than this
+POWER_SLEW_DOWN_W = 150             # max decrease per update (react fast)
+POWER_SLEW_UP_W = 40                # max increase per update (recover gently)
+
+# Fail-safe: if the UPS can't be read this many times in a row we are flying blind,
+# so clamp to a conservative per-GPU limit rather than assuming headroom.
+POWER_MAX_READ_FAILURES = 3
+DEFAULT_POWER_FALLBACK_W = 300      # per-GPU limit when the sensor is unavailable
+
+# NUT ups.status flags that mean "not on mains". On battery we clamp to the floor:
+# runtime matters far more than throughput during an outage.
+ON_BATTERY_FLAGS = ("OB", "LB")
+
+
+class UpsReader:
+    """Reads total system draw from NUT (`upsc <name>`).
+
+    This UPS (CyberPower CP1500PFCLCDa) does NOT expose `ups.realpower`, only
+    `ups.load` as an integer percent of `ups.realpower.nominal` — so watts are
+    derived, with nominal/100 resolution. `ups.status` is used to detect a mains
+    outage (`OB` = on battery, `LB` = low battery).
+    """
+
+    def __init__(self, ups_name: str = DEFAULT_UPS_NAME):
+        self.ups_name = ups_name
+        self.nominal_w: Optional[int] = None
+        self.consecutive_failures = 0
+
+    def _upsc(self) -> Dict[str, str]:
+        out = subprocess.run(
+            ["upsc", self.ups_name],
+            capture_output=True, text=True, timeout=5, check=True,
+        ).stdout
+        vars_: Dict[str, str] = {}
+        for line in out.splitlines():
+            if ":" in line:
+                k, _, v = line.partition(":")
+                vars_[k.strip()] = v.strip()
+        return vars_
+
+    def read(self) -> Optional[Tuple[float, bool]]:
+        """Return (total_watts, on_battery) or None if the UPS can't be read."""
+        try:
+            v = self._upsc()
+            if self.nominal_w is None:
+                self.nominal_w = int(float(v.get("ups.realpower.nominal", 0))) or None
+                if self.nominal_w:
+                    log.info(f"UPS '{self.ups_name}': {v.get('ups.model','?')} "
+                             f"nominal={self.nominal_w} W")
+            load_pct = float(v["ups.load"])
+            status = v.get("ups.status", "")
+            on_battery = any(f in status.split() for f in ON_BATTERY_FLAGS)
+            if not self.nominal_w:
+                raise ValueError("ups.realpower.nominal missing/zero")
+            self.consecutive_failures = 0
+            return (load_pct * self.nominal_w / 100.0, on_battery)
+        except Exception as e:
+            self.consecutive_failures += 1
+            log.error(f"UPS read failed ({self.consecutive_failures}): {e}")
+            return None
+
+
+class PowerGovernor:
+    """Keeps TOTAL UPS load under `budget` by capping GPU power limits.
+
+    Control law each tick:
+        non_gpu   = total_ups_watts - sum(gpu draw)
+        headroom  = budget - non_gpu
+        per_gpu   = clamp(headroom / n_gpus, hw_min, hw_max)
+    then deadband + asymmetric slew limiting before it is applied.
+
+    Attributing the remainder to `non_gpu` rather than modelling the CPU means the
+    loop is correct even if OTHER devices share the UPS — which is what we want,
+    since the thing being protected is the UPS, not the server.
+    """
+
+    def __init__(self, handles: List, budget_w: float = DEFAULT_POWER_BUDGET,
+                 ups_name: str = DEFAULT_UPS_NAME,
+                 interval: float = DEFAULT_POWER_INTERVAL,
+                 fallback_w: float = DEFAULT_POWER_FALLBACK_W,
+                 dry_run: bool = False):
+        self.handles = handles
+        self.budget_w = budget_w
+        self.interval = interval
+        self.fallback_w = fallback_w
+        self.dry_run = dry_run
+        self.ups = UpsReader(ups_name)
+        self.min_w: List[float] = []
+        self.max_w: List[float] = []
+        self.default_w: List[float] = []
+        self.applied_w: List[float] = []
+        self._last_run = 0.0
+        self._was_on_battery = False
+
+    def init(self):
+        for i, h in enumerate(self.handles):
+            lo, hi = pynvml.nvmlDeviceGetPowerManagementLimitConstraints(h)
+            self.min_w.append(lo / 1000.0)
+            self.max_w.append(hi / 1000.0)
+            self.default_w.append(
+                pynvml.nvmlDeviceGetPowerManagementDefaultLimit(h) / 1000.0)
+            self.applied_w.append(
+                pynvml.nvmlDeviceGetPowerManagementLimit(h) / 1000.0)
+            log.info(f"  GPU {i}: power limit range {self.min_w[i]:.0f}-{self.max_w[i]:.0f} W "
+                     f"(default {self.default_w[i]:.0f} W, now {self.applied_w[i]:.0f} W)")
+        log.info(f"Power budget: {self.budget_w:.0f} W total UPS load"
+                 + ("  [DRY RUN — nothing will be set]" if self.dry_run else ""))
+
+    def _set_limit(self, idx: int, watts: float):
+        watts = max(self.min_w[idx], min(self.max_w[idx], watts))
+        if abs(watts - self.applied_w[idx]) < 1.0:
+            return
+        if self.dry_run:
+            log.info(f"  [dry-run] GPU {idx}: would set limit {watts:.0f} W")
+            self.applied_w[idx] = watts
+            return
+        try:
+            pynvml.nvmlDeviceSetPowerManagementLimit(self.handles[idx], int(watts * 1000))
+            self.applied_w[idx] = watts
+        except pynvml.NVMLError as e:
+            log.error(f"GPU {idx}: could not set power limit {watts:.0f} W: {e}")
+
+    def clamp_all(self, watts: float, reason: str):
+        log.warning(f"⚠ POWER: clamping all GPUs to {watts:.0f} W — {reason}")
+        for i in range(len(self.handles)):
+            self._set_limit(i, watts)
+
+    def update(self, force: bool = False):
+        now = time.monotonic()
+        if not force and (now - self._last_run) < self.interval:
+            return
+        self._last_run = now
+
+        reading = self.ups.read()
+        if reading is None:
+            if self.ups.consecutive_failures >= POWER_MAX_READ_FAILURES:
+                self.clamp_all(self.fallback_w,
+                               f"UPS unreadable x{self.ups.consecutive_failures} (flying blind)")
+            return
+        total_w, on_battery = reading
+
+        # ── mains lost: runtime beats throughput, floor the cards immediately ──
+        if on_battery:
+            if not self._was_on_battery:
+                self.clamp_all(min(self.min_w), "ON BATTERY — maximising runtime")
+                self._was_on_battery = True
+            return
+        if self._was_on_battery:
+            log.info("Mains restored — resuming normal power governing")
+            self._was_on_battery = False
+
+        gpu_draw = 0.0
+        for i, h in enumerate(self.handles):
+            try:
+                gpu_draw += pynvml.nvmlDeviceGetPowerUsage(h) / 1000.0
+            except pynvml.NVMLError as e:
+                log.error(f"GPU {i}: power read failed: {e}")
+                return
+
+        non_gpu = max(0.0, total_w - gpu_draw)
+        headroom = self.budget_w - non_gpu
+        target = headroom / max(1, len(self.handles))
+
+        for i in range(len(self.handles)):
+            cur = self.applied_w[i]
+            want = max(self.min_w[i], min(self.max_w[i], target))
+            delta = want - cur
+            if abs(delta) < POWER_DEADBAND_W:
+                continue
+            if delta < 0:
+                want = cur - min(-delta, POWER_SLEW_DOWN_W)
+            else:
+                want = cur + min(delta, POWER_SLEW_UP_W)
+            self._set_limit(i, want)
+
+        log.info(f"POWER: ups={total_w:.0f}W gpu={gpu_draw:.0f}W other={non_gpu:.0f}W "
+                 f"budget={self.budget_w:.0f}W -> limits="
+                 + "/".join(f"{w:.0f}" for w in self.applied_w) + "W")
+
+    def restore_defaults(self):
+        if self.dry_run:
+            return
+        log.info("Restoring default GPU power limits...")
+        for i, h in enumerate(self.handles):
+            try:
+                pynvml.nvmlDeviceSetPowerManagementLimit(h, int(self.default_w[i] * 1000))
+                log.info(f"  GPU {i}: restored to {self.default_w[i]:.0f} W")
+            except pynvml.NVMLError as e:
+                log.error(f"  GPU {i}: could not restore power limit: {e}")
+
+
 class NvidiaFanController:
     def __init__(self, curve: List[Tuple[int, int]], poll_interval: float = 2.0,
-                 sync: bool = True, mirror: bool = False):
+                 sync: bool = True, mirror: bool = False, governor=None):
         self.curve = sorted(curve, key=lambda x: x[0])
         self.poll_interval = poll_interval
         # sync=True (default): ALL fans track the HOTTEST card ("perform as one card").
@@ -95,6 +307,10 @@ class NvidiaFanController:
         # (auto) curve, read the speed it chooses, and set the COOLER card to match.
         # Roles swap when the temps cross. The only curve in play is the card's own.
         self.mirror = mirror
+        # Optional PowerGovernor. Deliberately driven from THIS loop rather than a
+        # second daemon: capping power lowers temperature, so two independent
+        # controllers would be reacting to each other's output.
+        self.governor = governor
         self.running = False
         self.handles = []
         self.fan_counts = []
@@ -129,6 +345,10 @@ class NvidiaFanController:
         
         log.info(f"Fan curve: {self.curve}")
         log.info(f"Poll interval: {self.poll_interval}s")
+
+        if self.governor:
+            self.governor.handles = self.handles
+            self.governor.init()
     
     def get_fan_speed_for_temp(self, temp: int) -> int:
         """Calculate fan speed based on temperature using the curve"""
@@ -270,10 +490,14 @@ class NvidiaFanController:
                     self.update_fans_mirror()
                 else:
                     self.update_fans()
+                if self.governor:
+                    self.governor.update()   # no-ops until its own interval elapses
                 time.sleep(self.poll_interval)
         except KeyboardInterrupt:
             log.info("Interrupted by user")
         finally:
+            if self.governor:
+                self.governor.restore_defaults()
             self.restore_auto_control()
             pynvml.nvmlShutdown()
             log.info("Fan control daemon stopped.")
@@ -312,6 +536,41 @@ def main():
              "sync: every fan tracks the hottest card ('perform as one card')."
     )
     parser.add_argument(
+        "--power-budget",
+        type=float,
+        default=None,
+        metavar="WATTS",
+        help=f"Enable the power governor: cap GPU power limits so TOTAL UPS load stays "
+             f"under WATTS (e.g. --power-budget {DEFAULT_POWER_BUDGET:.0f}). Reads total "
+             f"draw from NUT. Off unless specified."
+    )
+    parser.add_argument(
+        "--ups",
+        default=DEFAULT_UPS_NAME,
+        help=f"NUT UPS name for the power governor (default: {DEFAULT_UPS_NAME}; see `upsc -l`)"
+    )
+    parser.add_argument(
+        "--power-interval",
+        type=float,
+        default=DEFAULT_POWER_INTERVAL,
+        help=f"Seconds between power-governor updates (default: {DEFAULT_POWER_INTERVAL}). "
+             f"The NUT driver only refreshes every ~2 s, so going below that buys nothing."
+    )
+    parser.add_argument(
+        "--power-fallback",
+        type=float,
+        default=DEFAULT_POWER_FALLBACK_W,
+        metavar="WATTS",
+        help=f"Per-GPU limit to clamp to if the UPS becomes unreadable "
+             f"(default: {DEFAULT_POWER_FALLBACK_W:.0f} W)"
+    )
+    parser.add_argument(
+        "--power-dry-run",
+        action="store_true",
+        help="Power governor logs what it WOULD set without touching the GPUs. "
+             "Use this first to sanity-check the budget against real load."
+    )
+    parser.add_argument(
         "--mirror",
         action="store_true",
         help="No custom curve: keep the HOTTER card on its own factory (auto) curve, read "
@@ -335,8 +594,21 @@ def main():
     log.info(f"NVIDIA Fan Control - Curve: {args.mode.upper()} - {mode_desc}")
     log.info("=" * 50)
 
+    governor = None
+    if args.power_budget is not None:
+        governor = PowerGovernor(
+            handles=[],                      # filled in by controller.init()
+            budget_w=args.power_budget,
+            ups_name=args.ups,
+            interval=args.power_interval,
+            fallback_w=args.power_fallback,
+            dry_run=args.power_dry_run,
+        )
+        log.info(f"Power governor ENABLED — budget {args.power_budget:.0f} W via UPS '{args.ups}'")
+
     controller = NvidiaFanController(curve, args.interval,
-                                     sync=not args.independent, mirror=args.mirror)
+                                     sync=not args.independent, mirror=args.mirror,
+                                     governor=governor)
     
     # Handle signals for clean shutdown
     def signal_handler(sig, frame):
@@ -350,6 +622,8 @@ def main():
     
     if args.once:
         controller.update_fans_mirror() if args.mirror else controller.update_fans()
+        if governor:
+            governor.update(force=True)
         log.info("Ran once. Fans will return to auto control after a few minutes.")
     else:
         controller.run()

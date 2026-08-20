@@ -1,11 +1,11 @@
 [Unit]
-Description=NVIDIA Aggressive Fan Control for AI Workloads
-After=nvidia-persistenced.service
-Wants=nvidia-persistenced.service
+Description=NVIDIA Fan Control + UPS-aware Power Governor for AI Workloads
+After=nvidia-persistenced.service nut-monitor.service
+Wants=nvidia-persistenced.service nut-monitor.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /opt/nvidia-fan-control/nvidia-fan-control.py --mode quiet --interval 1
+ExecStart=/usr/bin/python3 /opt/nvidia-fan-control/nvidia-fan-control.py --mode quiet --interval 1 --power-budget 900
 ExecStop=/bin/kill -SIGTERM $MAINPID
 Restart=on-failure
 RestartSec=5

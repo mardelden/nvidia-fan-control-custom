@@ -194,3 +194,78 @@ This is expected behavior - the script restores automatic fan control when stopp
 ## License
 
 MIT
+
+---
+
+## Power governor (fork addition)
+
+Closed-loop **whole-server** power cap: the UPS is the sensor, the GPU power limit is
+the actuator. Keeps total UPS load under a budget so the UPS can actually carry the
+machine instead of tripping on overload.
+
+```bash
+# see what it WOULD do, without touching anything
+python3 nvidia-fan-control.py --power-budget 900 --power-dry-run --once
+
+# run for real, alongside the fan curve
+python3 nvidia-fan-control.py --mode quiet --interval 1 --power-budget 900
+```
+
+### Why it lives in this daemon
+
+Capping power lowers temperature, which changes what the fan curve does. Two
+independent daemons would be reacting to each other's output. The governor is ticked
+from the fan loop and self-rate-limits to `--power-interval` (default 5 s).
+
+### Control law
+
+```
+non_gpu  = total_ups_watts − Σ(gpu power draw)
+headroom = budget − non_gpu
+per_gpu  = clamp(headroom / n_gpus, hw_min, hw_max)
+```
+
+Attributing the remainder to `non_gpu` instead of modelling the CPU means the loop
+stays correct even if **other devices share the UPS** — which is what we want, since
+the thing being protected is the UPS, not the server.
+
+### Anti-oscillation
+
+The NUT driver refreshes every ~2 s and NVML's own enforcement has its own time
+constant, so a naive proportional loop hunts. Three guards:
+
+| Guard | Value | Why |
+|---|---|---|
+| Deadband | 15 W | ignore jitter (GPU idle draw wobbles ~1 W) |
+| Slew down | 150 W/step | react fast in the safe direction |
+| Slew up | 40 W/step | recover gently, never overshoot the budget |
+
+Observed convergence at a 900 W budget: `600 → 450 → 366`, then steady.
+
+### Safety behaviour
+
+| Condition | Action |
+|---|---|
+| `ups.status` contains `OB`/`LB` (**on battery**) | clamp both GPUs to the hardware floor (150 W) — runtime beats throughput during an outage |
+| UPS unreadable ×3 | clamp to `--power-fallback` (default 300 W) rather than assume headroom |
+| Daemon exit | restore each GPU's factory default power limit |
+
+### Sensor limitations
+
+This UPS (CyberPower CP1500PFCLCDa) exposes **no** `ups.realpower`. Only
+`ups.load` as an **integer percent** of `ups.realpower.nominal` (1000 W), so:
+
+- watts are derived, at **10 W resolution**
+- the driver polls every ~2 s, so **transients under ~2 s are invisible**
+
+This governs *sustained* draw. It is not inrush protection.
+
+### Flags
+
+| Flag | Default | |
+|---|---|---|
+| `--power-budget WATTS` | *off* | total UPS load ceiling; enables the governor |
+| `--ups NAME` | `cyberpower` | NUT name, see `upsc -l` |
+| `--power-interval SEC` | `5.0` | below ~2 s buys nothing |
+| `--power-fallback WATTS` | `300` | per-GPU clamp when the sensor dies |
+| `--power-dry-run` | off | log only, change nothing |
