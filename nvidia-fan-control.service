@@ -1,17 +1,35 @@
 [Unit]
-Description=NVIDIA Fan Control + UPS-aware Power Governor for AI Workloads
+Description=NVIDIA GPU fan control + UPS/thermal power governor — sync across cards (headless NVML)
 After=nvidia-persistenced.service nut-monitor.service
 Wants=nvidia-persistenced.service nut-monitor.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /opt/nvidia-fan-control/nvidia-fan-control.py --mode quiet --interval 1 --power-budget 900
+# Reference invocation from pve-ai (2× RTX PRO 6000 on a CyberPower CP1500, nominal 1000 W).
+# Drop --power-budget/--ups/--power-fallback/--power-floor-on on hosts with no UPS; --temp-target
+# and --power-ceiling both work without one. Derive the budget as ~0.85-0.9 × ups.realpower.nominal.
+ExecStart=/usr/bin/python3 /opt/nvidia-fan-control/nvidia-fan-control.py --mirror --interval 2 --temp-target 90 --power-budget 900 --ups cyberpower --power-interval 5 --power-fallback 300 --power-floor-on OB
 ExecStop=/bin/kill -SIGTERM $MAINPID
-Restart=on-failure
+# `systemctl reload` re-reads the power-ceiling control file without bouncing fans.
+ExecReload=/bin/kill -SIGHUP $MAINPID
+Restart=always
 RestartSec=5
 
-# Run as root (required for fan control)
+# Root is required for NVML fan control. On SIGTERM the daemon restores each card's
+# own factory fan curve; NVML also auto-reverts manual fan control if the process
+# stops refreshing, so a crash can't leave the fans stuck. Target mode ramps toward the
+# configured temperature; a hard safety floor still forces 100% at 92 C. Lightweight.
 User=root
+MemoryMax=128M
+
+# Creates /var/lib/nvidia-fan-control, which holds the power-ceiling state/control file.
+# NVML power limits reset to the card default on reboot, so the daemon re-applies the
+# persisted ceiling at startup from here. Pin/unpin a running service without a restart:
+#   echo 300  > /var/lib/nvidia-fan-control/power-ceiling
+#   echo none > /var/lib/nvidia-fan-control/power-ceiling
+# --power-ceiling is deliberately NOT in ExecStart: leaving it off makes that file the
+# single source of truth, so a live pin survives `systemctl restart`.
+StateDirectory=nvidia-fan-control
 
 # Logging
 StandardOutput=journal

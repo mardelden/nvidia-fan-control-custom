@@ -58,8 +58,9 @@ below) rather than crashing, but the ordering avoids a noisy first minute.
 
 ## Configuration contract
 
-**All config is CLI flags in `ExecStart`.** No config file, no env vars, no secrets —
-nothing to put in OpenBao.
+**Config is CLI flags in `ExecStart`**, plus **one state file** for the power ceiling
+(`/var/lib/nvidia-fan-control/power-ceiling`, created by `StateDirectory=`). No env
+vars, no secrets — nothing to put in OpenBao.
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -67,21 +68,32 @@ nothing to put in OpenBao.
 | `--interval` | `2.0` | fan loop period (seconds) |
 | `--independent` | off | per-card fans instead of syncing to the hottest |
 | `--mirror` | off | hotter card stays on its factory curve; cooler card mirrors it |
-| **`--power-budget WATTS`** | **off** | **enables the governor.** Total UPS load ceiling |
+| **`--temp-target CELSIUS`** | **off** | own all fans as one thermal zone around a target (50..91). Overrides `--mode`/`--mirror`. With a governor, sustained heat at 100% fan also derates power |
+| **`--power-budget WATTS`** | **off** | **enables the governor.** Total UPS load budget |
+| **`--power-ceiling WATTS`** | **off** | **also enables the governor, with no UPS required.** Per-GPU upper limit; `WATTS`, `W,W` per GPU, or `none`. Persisted |
+| `--power-ceiling-file PATH` | `/var/lib/nvidia-fan-control/power-ceiling` | ceiling state + live control file |
+| `--no-power-ceiling-file` | off | this run only; read and write nothing |
 | `--ups NAME` | `cyberpower` | NUT UPS name — `upsc -l` |
 | `--power-interval` | `5.0` | governor period; below ~2 s buys nothing |
 | `--power-fallback` | `300` | per-GPU clamp when the UPS is unreadable |
 | `--power-floor-on FLAG[,FLAG...]` | `OB,LB` | statuses that immediately use hardware floor |
 | `--power-dry-run` | off | log only, change nothing |
 
-**The governor is off unless `--power-budget` is passed.** Hosts without a UPS run
-exactly as before.
+**The governor is off unless `--power-budget` or `--power-ceiling` is in play** (flag,
+or a ceiling persisted in the state file). Hosts with neither run exactly as before.
 
-Reference invocation (dev box, pve-ai):
+**Hosts with no UPS can still use `--power-ceiling`** — the governor degenerates to
+holding the cap, and fan control is unaffected.
+
+Reference invocation (dev box, pve-ai) — this is what actually runs there:
 
 ```
---mode quiet --interval 1 --power-budget 900 --power-floor-on OB
+--mirror --interval 2 --temp-target 90 --power-budget 900 --ups cyberpower \
+  --power-interval 5 --power-fallback 300 --power-floor-on OB
 ```
+
+`--power-ceiling` is deliberately absent: the state file is the source of truth so a live pin
+survives `systemctl restart`. See the power-ceiling section below.
 
 ## Per-host values that must NOT be copied blindly
 
@@ -101,8 +113,55 @@ number, and a host with no UPS should not enable the governor at all.
 |---|---|
 | `ups.status` matches `--power-floor-on` | clamp all GPUs to the hardware floor (150 W on RTX PRO 6000); default `OB,LB` |
 | UPS unreadable 3× consecutively | clamp to `--power-fallback` rather than assume headroom |
-| Daemon exits / restarts | restores each GPU's **factory default** power limit and auto fan policy |
-| GPU ≥ 87 °C | fan safety floor forces 100%, independent of the curve |
+| Daemon exits / restarts, no ceiling | restores each GPU's **factory default** power limit and auto fan policy |
+| Daemon exits / restarts, ceiling set | **leaves GPUs pinned at the ceiling** (fan policy still returns to auto) |
+| Ceiling outside the hardware range | clamped into `[min, hw_max]` and logged; never an error |
+| Malformed ceiling control file | logged and **ignored**; the active cap is retained |
+| 100% fan and still ≥ `--temp-target` + 2 °C for a dwell | thermal governor derates the shared power cap (needs `--power-budget` or `--power-ceiling`) |
+| GPU ≥ 92 °C (`CRITICAL_TEMP`) | fan safety floor forces 100%, independent of the curve |
+
+## Power ceiling — operator contract
+
+`--power-ceiling` replaces the card hardware max (600 W) as the value the governor
+restores toward, so power can be pinned at a chosen wattage while fan control and the
+UPS loop keep running. Added for benchmark repeatability: dynamic power made
+config-to-config comparisons noisy.
+
+```bash
+# pin / repin / unpin the RUNNING service — no restart, no bounce
+echo 300  | sudo tee /var/lib/nvidia-fan-control/power-ceiling
+echo none | sudo tee /var/lib/nvidia-fan-control/power-ceiling
+sudo systemctl reload nvidia-fan-control     # optional; SIGHUP re-reads immediately
+
+# what is pinned right now
+cat /var/lib/nvidia-fan-control/power-ceiling
+nvidia-smi --query-gpu=index,power.limit,power.max_limit --format=csv
+```
+
+Three things to know:
+
+1. **`ExecStart` deliberately does NOT pass `--power-ceiling`.** An explicit flag
+   overrides the state file at startup, so leaving it out makes the file the single
+   source of truth and lets a live pin survive `systemctl restart`. If you add the flag
+   to the unit, expect a restart to reset any live override to the declared value.
+   (`plans/decisions/001-power-ceiling-precedence.md`)
+2. **A ceiling outlives the daemon.** `systemctl stop` leaves the cards pinned — that is
+   the `nvidia-smi -pl` semantic the feature exists to provide. To hand the cards back
+   to stock you must unpin explicitly (`none`).
+3. **The cap is enforced against out-of-band writes.** Each governor tick re-reads the hardware
+   limit and re-applies the ceiling if something else raised it (a manual `nvidia-smi -pl`, another
+   script). Verified live on pve-ai. Lowering a ceiling is immediate; **raising** one waits for the
+   supervised restore path (idle dwell 60 s, or a headroom dwell), so do not expect an instant jump.
+4. **Reboot persistence is re-application, not hardware.** NVML power limits reset to
+   the card default on reboot; the daemon re-applies the persisted ceiling at service
+   start. There is a short window early in boot where the cards sit at 600 W. Nothing
+   is loaded then, but do not treat the ceiling as a firmware-level guarantee.
+
+With a budget also set, the ceiling changes nothing about the control law — the
+governor still throttles *below* it under UPS pressure and restores up to, never above,
+it. A ceiling at or under the UPS-safe wattage simply gives the loop no reason to
+throttle, which is the constant-power state benchmarks want. `--power-fallback` is
+bounded by the ceiling too.
 
 ## Gotchas
 
@@ -113,6 +172,16 @@ number, and a host with no UPS should not enable the governor at all.
   `ups.load` as an **integer percent** of nominal, refreshed every ~2 s. Watts are
   derived at **10 W resolution**, and **sub-2 s transients are invisible**. This
   governs sustained draw; it is *not* inrush protection.
+- **The learned cap belongs to its workload.** The governor keeps ONE common cap across cards and
+  trims it by the measured whole-system excess split across *active* cards only (idle neighbours no
+  longer dilute the correction). It does not chase low UPS samples upward mid-job: caps reset to MAX
+  only after every card has been idle (< 75 W board draw, < 5% utilization) for 60 s. Raising also
+  needs 3 consecutive under-budget samples and 30 s since the last change; down is 150 W/tick, up is
+  20 W/step.
+- **Fans are the first actuator, power is the second.** With `--temp-target`, power is only derated
+  after the fan has reached 100% and the card is still 2 °C over target for a dwell. Recovery is
+  slower than derating (30 s of being 2 °C *below* target), and while the thermal hold is engaged
+  UPS-driven recovery is suppressed so the two loops cannot fight.
 - **Reactive, not a permanent ceiling (changed 2026-08-20).** The governor leaves the
   GPUs at their MAX limit while the UPS has headroom, and only throttles once total load
   goes over budget — on the FIRST over-budget tick (grace=1). A truly brief spike still passes:
@@ -139,8 +208,10 @@ number, and a host with no UPS should not enable the governor at all.
   the thing being protected is the UPS. But it means unrelated load silently reduces
   GPU headroom, which can look like an unexplained throttle.
 - **Fan control overrides the factory curve**, so a too-gentle custom curve can leave a
-  hot card under-cooled. The 87 °C floor is the backstop; the GPU's own thermal
-  throttle (~88–90 °C) and shutdown (~95 °C) are the hardware ones.
+  hot card under-cooled. The 92 °C `CRITICAL_TEMP` floor is the backstop; the GPU's own
+  thermal throttle (~88–90 °C) and shutdown (~95 °C) are the hardware ones. With
+  `--temp-target` the loop should hold the cards well below that, derating power if the
+  fans run out of authority.
 
 ## Suggested validation before enabling
 
