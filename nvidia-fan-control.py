@@ -176,11 +176,15 @@ TEMP_EMERGENCY_MAX_C = 95
 EMERGENCY_DWELL_S = 2.0
 EMERGENCY_RELEASE_DROP_C = 30
 EMERGENCY_RELEASE_DWELL_S = 30.0
-# If any card's temperature can't be read for this many consecutive readings, the
-# governor is blind: every GPU goes to its minimum power and the fans we own go to 100%
-# (native fans stay with the factory curve, which reads the sensor itself). Released once
-# every card reads again for BLIND_RELEASE_DWELL_S; power then walks back up in +20 W steps.
+# If any card's temperature is unreadable in BLIND_READ_FAILURES of the last
+# BLIND_WINDOW_READINGS readings, the governor is blind: every GPU goes to its minimum power
+# and the fans we own go to 100% (native fans stay with the factory curve, which reads the
+# sensor itself). A window, not a run: a flaky sensor that fails 2 readings in 3 never makes
+# 3 in a row. Released once the window is clear and every card has read for
+# BLIND_RELEASE_DWELL_S; power then walks back up in +20 W steps. Below the threshold, a
+# missing card counts at its last known temperature, so it can't hide from the emergency.
 BLIND_READ_FAILURES = 3
+BLIND_WINDOW_READINGS = 5
 BLIND_RELEASE_DWELL_S = 30.0
 
 
@@ -1115,25 +1119,25 @@ class PowerGovernor:
             self._was_power_floor = False
 
         # A power-limit change and the UPS reading are asynchronous. Hold after every
-        # downward step until NUT publishes a different sample; otherwise a cached total
-        # plus falling GPU draw invents rising non-GPU load.
+        # downward step, and after a fast raise, until NUT publishes a different sample;
+        # otherwise a cached total plus changing GPU draw invents non-GPU load or headroom.
         if self._feedback_wait_total_w is not None:
             old_total = self._feedback_wait_total_w
             old_status = self._feedback_wait_status_flags
             elapsed = now - self._feedback_wait_since
             if total_w != old_total or status_flags != old_status:
-                log.info(f"POWER: fresh UPS feedback after throttle: {old_total:.0f}W/"
+                log.info(f"POWER: fresh UPS feedback after the last step: {old_total:.0f}W/"
                          f"{' '.join(old_status)} -> {total_w:.0f}W/{' '.join(status_flags)}")
                 self._feedback_wait_total_w = None
             elif elapsed < POWER_FEEDBACK_TIMEOUT_S:
                 log.info(f"POWER: ups={total_w:.0f}W status={' '.join(status_flags)} — "
-                         f"awaiting fresh feedback after throttle "
+                         f"awaiting fresh feedback after the last step "
                          f"({elapsed:.0f}/{POWER_FEEDBACK_TIMEOUT_S:.0f}s), limits held "
                          + "/".join(f"{w:.0f}" for w in self.applied_w) + "W")
                 return
             else:
                 log.warning(f"⚠ POWER: no fresh UPS feedback for {elapsed:.0f}s; "
-                            "allowing another throttle decision")
+                            "allowing another decision")
                 self._feedback_wait_total_w = None
 
         gpu_state = self._read_gpu_power_and_activity()
@@ -1225,8 +1229,12 @@ class PowerGovernor:
                          + "/".join(f"{w:.0f}" for w in self.applied_w) + "W")
                 return
             headroom_w = (self.budget_w - POWER_RESTORE_MARGIN_W) - total_w
-            raise_w = max(POWER_SLEW_UP_W, min(self.raise_step_w(),
-                                               headroom_w / max(1, active_gpu_count)))
+            if self.recovery_walk:
+                # recovering after a thermal hold: the exponential step, bounded by headroom
+                raise_w = max(POWER_SLEW_UP_W, min(self.raise_step_w(),
+                                                   headroom_w / max(1, active_gpu_count)))
+            else:
+                raise_w = POWER_SLEW_UP_W       # a UPS-budget trim restores slowly (#2)
             target = min(max_common_cap, self.learned_cap_w + raise_w)
             self._headroom_ticks = 0
             mode = "restore"
@@ -1253,10 +1261,15 @@ class PowerGovernor:
             self.learned_cap_w = min(self.applied_w)
             self._last_limit_change = now
             if mode == "throttle":
+                # the budget binds now: any further restore is a UPS restore, +20 W (#2)
+                self.recovery_walk = False
+            # after a cut, or a raise bigger than the slow step, the next decision waits for
+            # a UPS sample that has seen it (NUT can hold a value for ~36 s)
+            if mode == "throttle" or (mode == "restore" and raise_w > POWER_SLEW_UP_W):
                 self._feedback_wait_total_w = total_w
                 self._feedback_wait_status_flags = status_flags
                 self._feedback_wait_since = now
-                log.info(f"POWER: throttle step applied; awaiting fresh UPS feedback "
+                log.info(f"POWER: {mode} step applied; awaiting fresh UPS feedback "
                          f"(timeout {POWER_FEEDBACK_TIMEOUT_S:.0f}s)")
 
         log.info(f"POWER: ups={total_w:.0f}W gpu={gpu_draw:.0f}W other={non_gpu:.0f}W "
@@ -1276,12 +1289,14 @@ class PowerGovernor:
             return
         for i, h in enumerate(self.handles):
             restore_to = self.ceiling_w[i] if self.ceiling_w is not None else self.default_w[i]
-            final = min(self.applied_w[i], restore_to)
-            why = ("ceiling" if self.ceiling_w is not None and final >= restore_to - 0.5
-                   else "default" if final >= restore_to - 0.5 else "kept lowered")
             try:
+                # the device, not just our cache: an out-of-band `nvidia-smi -pl` lower is
+                # kept too (#3)
                 current = pynvml.nvmlDeviceGetPowerManagementLimit(h) / 1000.0
-                if abs(current - final) >= 1.0:
+                final = min(current, self.applied_w[i], restore_to)
+                why = ("ceiling" if self.ceiling_w is not None and final >= restore_to - 0.5
+                       else "default" if final >= restore_to - 0.5 else "kept lowered")
+                if current - final >= 1.0:
                     pynvml.nvmlDeviceSetPowerManagementLimit(h, int(final * 1000))
                 log.info(f"  GPU {i}: power left at {final:.0f} W ({why})")
             except pynvml.NVMLError as e:
@@ -1326,7 +1341,8 @@ class FanController:
         self.last_temps: Dict[int, int] = {}
         self.messages: List[str] = []
         self._written_generation = -1
-        self._read_failures = 0
+        self._read_history: List[bool] = []     # True = a card was unreadable (blind window)
+        self._blind_reported = False
         # set here, not in run(): a stop requested during init() must be honoured (#6)
         self.running = True
         self._last_runtime_save = 0.0
@@ -1541,28 +1557,36 @@ class FanController:
         if changes or masked or self.store.generation != self._written_generation:
             self._write_effective()
         temps = self._read_temps()
-        if len(temps) < len(self.handles):
-            # Fail safe (#1): a card we can't read might be the hot one. One bad reading is
-            # tolerated; after BLIND_READ_FAILURES in a row the governor goes blind.
-            self._read_failures += 1
-            if self._read_failures >= BLIND_READ_FAILURES:
-                if self._read_failures == BLIND_READ_FAILURES:
-                    log.warning(f"⚠ BLIND: {len(self.handles) - len(temps)} GPU temperature(s) "
-                                f"unreadable for {self._read_failures} readings -> minimum power"
-                                + ("; fans 100%" if self._fans_owned() else
-                                   "; native fans stay on the factory curve"))
-                self.governor.observe_blind(True)
-                if self._fans_owned():
-                    for gpu in range(len(self.handles)):
-                        self._set_speed(gpu, 100)
-                return
-            if not temps:
-                return
+        missing = len(self.handles) - len(temps)
+        # Fail safe (#1, #5): a card we can't read might be the hot one. The odd bad reading
+        # is tolerated; BLIND_READ_FAILURES in the last BLIND_WINDOW_READINGS make it blind.
+        self._read_history = (self._read_history + [missing > 0])[-BLIND_WINDOW_READINGS:]
+        failures = sum(self._read_history)
+        if failures >= BLIND_READ_FAILURES:
+            if not self._blind_reported:
+                self._blind_reported = True
+                log.warning(f"⚠ BLIND: GPU temperature unreadable in {failures} of the last "
+                            f"{len(self._read_history)} readings -> minimum power"
+                            + ("; fans 100%" if self._fans_owned() else
+                               "; native fans stay on the factory curve"))
+            self.governor.observe_blind(True)
+            if self._fans_owned():
+                for gpu in range(len(self.handles)):
+                    self._set_speed(gpu, 100)
+            return
+        if missing:
+            # tolerated: count the missing card at its last known temperature, so it can't
+            # reset the emergency timer or fake a sudden rise when it reads again
+            for gpu in range(len(self.handles)):
+                if gpu not in temps and gpu in self.last_temps:
+                    temps[gpu] = self.last_temps[gpu]
         else:
-            if self._read_failures >= BLIND_READ_FAILURES:
+            if self._blind_reported:
+                self._blind_reported = False
                 log.info("BLIND: all GPU temperatures readable again")
-            self._read_failures = 0
             self.governor.observe_blind(False)
+        if not temps:
+            return
         self.last_temps = temps
         hottest = max(temps.values())
         self.governor.observe_emergency(hottest, self.emergency_c)

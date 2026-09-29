@@ -103,10 +103,11 @@ off the fans are left alone; every other profile, and mirror, forces them to 100
 released once the card is **30 °C below** the emergency temperature for 30 s, and power then
 walks back up in +20 W steps.
 
-**If a card's temperature can't be read for 3 readings in a row (6 s)**, the daemon is blind and
+**If a card's temperature can't be read in 3 of the last 5 readings**, the daemon is blind and
 fails safe: every GPU goes to its minimum power, and the fans it owns go to 100%. `native` fans
 keep the factory curve, which reads the sensor itself. It's released after 30 s of good
-readings, again with +20 W steps.
+readings, again with +20 W steps. Below that, a card that misses a reading counts at its last
+known temperature, so a flaky sensor can't reset the emergency timer or fake a sudden rise.
 
 **Stopping the service never raises any card's power.** A ceiling, a hold, a UPS on-battery
 floor or a budget trim all stay in place until the next start.
@@ -116,7 +117,8 @@ floor or a budget trim all stay in place until the next start.
 With `--power-budget`, the governor keeps **total** UPS load (CPU, board and disks included)
 under the budget. It trims one shared cap by the measured excess on the first over-budget
 reading, then restores slowly: three consecutive readings with headroom, +20 W, and at least
-30 s between raises. An `OB` status clamps every GPU to its floor. If the UPS can't be read
+30 s between raises. Only a recovery from a thermal hold takes the faster exponential step,
+bounded by the measured headroom, and then waits for a fresh UPS sample before the next one. An `OB` status clamps every GPU to its floor. If the UPS can't be read
 3 times in a row, the cards go to `--power-fallback`.
 
 The UPS is a **pull**, and a coarse one: `ups.load` is an integer percent of nominal (10 W

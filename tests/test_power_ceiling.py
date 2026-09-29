@@ -156,6 +156,12 @@ g.restore_defaults()
 check("a thermal hold on exit keeps the lowered limit (never raise a hot card)",
       limits() == [220.0, 220.0], limits())
 
+g = make(ceiling=[300.0])
+nv.DEVS[0].limit = 200.0                     # an out-of-band nvidia-smi -pl 200
+g.restore_defaults()
+check("stop after an out-of-band lower keeps it (re-review #3: never raise)",
+      limits() == [200.0, 300.0], limits())
+
 print("\n== no ceiling => original behaviour ==")
 g = make(budget=900.0)
 check("max_w is the hardware max", g.max_w == [600.0, 600.0], g.max_w)

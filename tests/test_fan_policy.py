@@ -662,6 +662,90 @@ gov.update(force=True)
 check("UPS budget mode still respects the ceiling", max(limits()) <= 300.0, limits())
 
 
+print("\n== a flaky sensor can't hide a hot card (re-review #5) ==")
+ctl, gov, *_ = rig(saved={"profile": "quiet"})
+set_temp(60, 95)
+tick(ctl, 1)                                 # 95C seen: the emergency timer starts
+nv.DEVS[1].temp_fail = True
+tick(ctl, 1)                                 # unreadable: counted at its last known 95C
+check("unreadable every other reading: the emergency still trips (last known temperature)",
+      gov.emergency_active and limits() == [150.0, 150.0], (gov.emergency_active, limits()))
+check("...and one bad reading alone isn't blind", not gov.blind_active)
+ctl, gov, *_ = rig(saved={"profile": "quiet", "ceiling": "300"})
+set_temp(60, 60)
+tripped = None
+for n, bad in enumerate([True, True, False, True, True, False], 1):
+    nv.DEVS[1].temp_fail = bad
+    tick(ctl, 1)
+    if gov.blind_active and tripped is None:
+        tripped = n
+check("unreadable 2 readings in 3: blind by the 4th reading (3 of the last 5)", tripped == 4, tripped)
+ctl, gov, *_ = rig(saved={"profile": "quiet", "target": "85"})
+set_temp(70, 80)
+tick(ctl, 3)
+nv.DEVS[1].temp_fail = True
+tick(ctl, 1)
+nv.DEVS[1].temp_fail = False
+tick(ctl, 2)
+check("a card reading again after a gap is no sudden rise: no predictive cut",
+      limits() == [600.0, 600.0] and not gov.thermal_limited, limits())
+
+print("\n== UPS-budget restores stay slow; only a thermal recovery is fast (re-review #2) ==")
+ctl, gov, *_ = rig(saved={"profile": "quiet", "target": "80"}, budget=900)
+set_temp(50, 50)                             # cool: 28C under the release point
+for d in nv.DEVS:
+    d.draw, d.util = 450.0, 90
+gov.ups.read = lambda: (1100.0, ("OL",))
+for _ in range(4):
+    gov._feedback_wait_total_w = None
+    gov.update(force=True); CLOCK.advance(10.0)
+trimmed = limits()[0]
+check("UPS over budget: trimmed", trimmed < 600.0, limits())
+gov.ups.read = lambda: (500.0, ("OL",))
+steps = []
+for _ in range(12):
+    before = limits()[0]
+    gov._feedback_wait_total_w = None
+    ctl.update(); gov.update(force=True); CLOCK.advance(10.0)
+    if limits()[0] != before:
+        steps.append(limits()[0] - before)
+check("a UPS trim restores +20 W at a time, even with a target set and the cards cool",
+      steps and set(steps) == {20.0}, steps)
+
+ctl, gov, *_ = rig(saved={"profile": "quiet", "target": "80"}, budget=900)
+for d in nv.DEVS:
+    d.draw, d.util = 300.0, 90
+gov.ups.read = lambda: (500.0, ("OL",))
+gov.update(force=True)
+set_temp(86, 50)
+ctl.update()                                 # thermal cut 600 -> 300
+set_temp(60, 50)
+tick(ctl, 17)                                # hold released
+raised = False
+for _ in range(20):
+    gov._feedback_wait_total_w = None
+    gov.update(force=True); CLOCK.advance(10.0)
+    ctl.update()
+    if limits()[0] > 300.0:
+        raised = True
+        break
+step = limits()[0] - 300.0
+check("after a thermal hold the raise is still fast (bounded by headroom)", raised and step > 20.0,
+      limits())
+check("...and the next decision waits for a fresh UPS sample",
+      gov._feedback_wait_total_w is not None)
+held = limits()
+gov.update(force=True)                       # the same (stale) UPS reading
+check("...so a stale reading can't stack a second fast raise", limits() == held, (held, limits()))
+
+print("\n== no GPUs reported: no crash (re-review #4) ==")
+try:
+    ctl, gov, *_ = rig(n=0)
+    tick(ctl, 2)
+    check("0 GPUs: a tick doesn't raise", True)
+except Exception as e:
+    check("0 GPUs: a tick doesn't raise", False, repr(e))
+
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
     print("FAILED: " + "; ".join(FAIL))
