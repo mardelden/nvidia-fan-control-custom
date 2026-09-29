@@ -304,3 +304,33 @@ Observations:
 - **The new script is a drop-in for the old unit.** Production's exact `ExecStart`
   (`--mirror --temp-target 85 …`) gives adaptive + mirror on + target 85, which is today's
   behaviour. So the deploy is safe in two steps: the daemon first, then the unit and the seed.
+
+## Addendum (2026-09-29, later the same day): thermal law tuned live, and review fixes
+
+**The thermal law was tuned on hardware** with the operator. The cut rules in this plan
+(target + 2 °C, 5 s, linear steps) are superseded by `decisions/009-thermal-law-tuned-on-hardware.md`:
+
+- the cut is at the target, 30 W × 2^(°C over), at most 50% per step;
+- the grace applies only while the temperature is steady;
+- prediction per reading;
+- hold while falling;
+- exponential recovery.
+
+The overshoot peak went from +7 °C to 0.
+
+**The deploy team's review of `1b78437`** (proxmox request 002) is addressed:
+
+| # | Finding | Resolution |
+|---|---|---|
+| 1 | Unreadable temperatures → no fail-safe | Blind after 3 readings: minimum power, owned fans 100%; release after 30 s good |
+| 2 | `native` at the emergency doesn't force fans | **Kept by operator decision:** power cut only, fans untouched |
+| 3 | Stop during a UPS on-battery event raised power | Stopping never raises any card's power |
+| 4 | `--power-dry-run` aliased the full dry run | Power-only again |
+| 5 | A bad runtime-state file crash-looped the daemon | Set aside as `.bad`; the daemon starts fresh |
+| 6 | SIGTERM during init() was lost | The stop request is honoured |
+| — | Masked profile ack used a different format | Uses the same `describe()` as the unmasked ack |
+
+**Known, not fixed:** unequal per-GPU ceilings. The shared cap would drop the higher card to the
+lower card's level on the first cut. Every production host uses equal ceilings.
+
+Tests: 164 fake-NVML assertions (`test_fan_policy.py` 142, `test_power_ceiling.py` 22).

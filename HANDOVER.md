@@ -89,11 +89,12 @@ or target is acknowledged as *masked by a command-line flag*.
 | Condition | Action |
 |---|---|
 | Card ≥ `--temp-emergency` for 2 s | Every GPU to its hardware minimum (150 W). Fans: 100% unless the profile is `native` with mirror off. Released at emergency − 30 °C for 30 s, then walks up +20 W / 30 s |
-| Card ≥ target + 2 °C for 5 s (adaptive: and fans ≥ its fan max) | Power cut in 20–150 W steps; released at target − 2 °C for 30 s, then walks up |
+| Card at the target (adaptive: and fans at its fan max) | Power cut: 30 W × 2^(°C over), at most 50%. A 5 s grace only if the card is steady; none if it's still climbing; a cut before the target if it rises ≥ 2 °C in one reading. Released at target − 2 °C for 30 s, then exponential recovery (fork decisions/009) |
+| A card's temperature unreadable for 3 readings | Blind: every GPU to its minimum power, owned fans 100% (`native` left alone); released after 30 s of good readings, +20 W steps |
 | UPS status matches `--power-floor-on` | Every GPU to its hardware floor, immediately |
 | UPS unreadable 3× | Clamp to `--power-fallback` (never raising a card that's in a hold) |
 | Total UPS load > budget | Trim the shared cap by the measured excess; restore slowly |
-| Service stops cleanly | Fans → factory curve. Power: stays at the ceiling, or stays **lowered** if a hold is active (it never raises a hot card) |
+| Service stops cleanly | Fans → factory curve. Power is **never raised**: the ceiling, holds, the on-battery floor and budget trims all stay until the next start |
 | Service crashes | Fans stay where they were unless `ExecStopPost=--reset-fans` runs (see above) |
 | Restart / reboot | Settings come back from the files. The learned adaptive trim is restored; thermal and emergency holds are restored if < 5 min old |
 
@@ -118,11 +119,21 @@ python3 /opt/nvidia-fan-control/nvidia-fan-control.py --clear-override
 - **The budget usually binds before the ceiling does.** At a 600 W ceiling, one loaded card plus
   CPU load hit 990 W and the governor throttled to 510 W. At a 300 W ceiling, two cards at full
   load sat at ~870 W, which is close to the 900 W budget.
-- **Raising a limit is slow by design** (+20 W per 30 s, or the 60 s idle reset). Lowering is
-  immediate.
+- **Raising a limit is supervised.** Lowering is immediate. After a hold, power returns every
+  30 s in exponential steps (+20 W just under the line, up to +50% when clearly cool); after an
+  emergency or blind hold, +20 W steps.
+- **Keep per-GPU ceilings equal** (`300`, not `600,300`) until the per-card cap exists. Today
+  the first cut would drop the higher card to the lower one's level. `gpu-ceiling-set`
+  accepts `W,W`, so it's worth refusing unequal values there for now.
+- **`--power-dry-run` is power-only** (fans and the emergency still run); `--dry-run` touches
+  nothing at all.
 - **The thermal cut is a shared cap**, so every card drops when the hottest card is over.
 - **`adaptive` needs a target.** Setting it without one is refused. Clearing the target while
   it's active falls back to `native`.
+- **The maximum target is emergency − 3 (89 °C).** Our old docs said 90–91; the cut point is
+  now the target itself, and that cap keeps room before the emergency.
+- **A bad `runtime-state.json` is set aside as `.bad`** and the daemon starts fresh; it can't
+  crash-loop.
 - **Per-GPU fan profiles aren't supported** (refused); the power ceiling is per GPU.
 
 ## Validation

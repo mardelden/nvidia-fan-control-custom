@@ -191,16 +191,15 @@ check("mirror on + emergency: both fans 100%", fans() == [100, 100], fans())
 
 
 # ───────────────────────────────────────────────────────────────────────────
-print("\n== temperature target, fixed curves: cut at target+2 for 5 s, fans irrelevant ==")
+print("\n== temperature target, fixed curves: cut AT the target after a 5 s grace, fans irrelevant ==")
 ctl, gov, store, state, run = rig(saved={"profile": "quiet", "target": "80"})
-set_temp(81, 70)
+set_temp(79, 70)
 tick(ctl, 6)
-check("no cut at target+1", limits() == [600.0, 600.0], limits())
-set_temp(82, 70)
-tick(ctl, 2)     # 0 s, then 2 s
-check("no cut before 5 s at target+2", limits() == [600.0, 600.0], limits())
-tick(ctl, 2)     # 4 s, 6 s -> cut
-check("cut after 5 s at target+2", max(limits()) < 600.0, limits())
+check("no cut below the target", limits() == [600.0, 600.0], limits())
+set_temp(80, 70)
+tick(ctl, 1)
+check("a card CLIMBING into the target (79 -> 80) is cut at once, no grace (-30 W)",
+      limits() == [570.0, 570.0], limits())
 check("thermal hold engaged", gov.thermal_limited)
 cut = limits()[0]
 set_temp(78, 70)       # = target-2
@@ -217,6 +216,137 @@ check("no jump straight after release", limits()[0] == before, limits())
 tick(ctl, 12)                # past the 30 s dwell
 check("+20 W step after the dwell", limits()[0] == before + nfc.POWER_SLEW_UP_W, limits())
 
+
+print("\n== exponential cut: 30 W x 2^(degrees over target), at most 50% of power ==")
+def first_cut(temp, target=80, profile="quiet", wait=True):
+    ctl, gov, *_ = rig(saved={"profile": profile, "target": str(target)})
+    set_temp(temp, 50)
+    ctl.update()                      # first reading over the cut point
+    if wait:
+        CLOCK.advance(5.0); ctl.update()
+    return 600.0 - limits()[0]
+check("at the target: -30 W after the 5 s grace", first_cut(80) == 30.0, first_cut(80))
+check("+1C: -60 W after the grace", first_cut(81) == 60.0, first_cut(81))
+check("+2C: -120 W after the grace", first_cut(82) == 120.0, first_cut(82))
+check("+3C: -240 W after the grace", first_cut(83) == 240.0, first_cut(83))
+check("+3C does NOT skip the grace", first_cut(83, wait=False) == 0.0, first_cut(83, wait=False))
+check("+4C: NO grace, capped at 50% of power (-300 W at 600 W)", first_cut(84, wait=False) == 300.0,
+      first_cut(84, wait=False))
+
+print("\n== hold while cooling: no second cut until the card stops cooling ==")
+ctl, gov, *_ = rig(saved={"profile": "quiet", "target": "80"})
+set_temp(86, 50)
+ctl.update()
+check("big overshoot cut at once to 300 W", limits()[0] == 300.0, limits())
+set_temp(85, 50)
+CLOCK.advance(6.0); ctl.update()
+check("falling 86 -> 85: power held, no second cut", limits()[0] == 300.0, limits())
+set_temp(84, 50)
+CLOCK.advance(6.0); ctl.update()
+check("still falling 85 -> 84: still held", limits()[0] == 300.0, limits())
+CLOCK.advance(6.0); ctl.update()
+check("stopped falling at 84C (+4C over): cut again, 50% of 300 -> 150 W", limits()[0] == 150.0,
+      limits())
+
+print("\n== ...but a card that PLATEAUS over the target is cut again (pve-ai test B) ==")
+ctl, gov, *_ = rig(saved={"profile": "quiet", "target": "60"})
+set_temp(70, 50)
+ctl.update()
+check("+8C: one 50% cut to 300 W", limits()[0] == 300.0, limits())
+set_temp(63, 50)
+CLOCK.advance(6.0); ctl.update()
+check("falling 70 -> 63: held at 300 W", limits()[0] == 300.0, limits())
+CLOCK.advance(6.0); ctl.update()
+check("flat at 63C, still over the 60C target: cut again (+3C -> -240, capped 50% -> 150 W)",
+      limits()[0] == 150.0, limits())
+
+print("\n== exponential recovery: +20 W x 2^(degrees below target-2), at most +50% ==")
+def recovery_step(cool_to, target=80):
+    ctl, gov, *_ = rig(saved={"profile": "quiet", "target": str(target)})
+    set_temp(target + 6, 50)
+    ctl.update()                                   # one big cut: 600 -> 300
+    set_temp(cool_to, 50)
+    tick(ctl, 17)                                  # 34 s at <= target-2: hold released
+    assert not gov.thermal_limited, "hold should have released"
+    before = limits()[0]
+    tick(ctl, 16)                                  # past the 30 s raise dwell
+    return limits()[0] - before
+check("just under the release point (78C): +20 W", recovery_step(78) == 20.0, recovery_step(78))
+check("2C below it (76C): +80 W", recovery_step(76) == 80.0, recovery_step(76))
+check("well below (60C): capped at +50% of power (+150 W at 300 W)", recovery_step(60) == 150.0,
+      recovery_step(60))
+
+ctl, gov, *_ = rig(saved={"profile": "quiet", "target": "80"})
+set_temp(93, 60)
+ctl.update(); CLOCK.advance(2.0); ctl.update()
+check("emergency hold at 150 W", limits() == [150.0, 150.0], limits())
+set_temp(40, 38)
+tick(ctl, 17)
+check("emergency released", not gov.emergency_active)
+before = limits()[0]
+tick(ctl, 16)
+check("after an EMERGENCY recovery stays +20 W even though the card is 38C below target",
+      limits()[0] - before == 20.0, (before, limits()))
+
+ctl, gov, *_ = rig(saved={"profile": "quiet", "target": "80"}, budget=900)
+for d in nv.DEVS:
+    d.draw, d.util = 300.0, 90
+gov.ups.read = lambda: (500.0, ("OL",))
+gov.update(force=True)
+set_temp(86, 50)
+ctl.update()                                       # cut 600 -> 300
+set_temp(60, 50)
+tick(ctl, 17)
+gov.ups.read = lambda: (800.0, ("OL",))            # only 50 W of headroom to 850 W
+for _ in range(20):
+    gov._feedback_wait_total_w = None
+    gov.update(force=True); CLOCK.advance(10.0)
+    ctl.update()
+    if limits()[0] > 300.0:
+        break
+check("UPS budget mode: the raise is bounded by headroom (50 W over 2 cards -> +25 W, not +150)",
+      300.0 < limits()[0] <= 325.0, limits())
+
+print("\n== rate of rise: cut at the ONSET when the prediction reaches the target ==")
+def rise(temps, target=75, profile="quiet", **kw):
+    ctl, gov, *_ = rig(saved={"profile": profile, "target": str(target)}, **kw)
+    for t in temps:
+        set_temp(t, 40)
+        ctl.update()
+        CLOCK.advance(2.0)
+    return ctl, gov
+ctl, gov = rise([64, 70])          # 3 C/s: predicted 70 + 12 = 82 >= 75
+check("fast rise (3 C/s): cut at 70C, BEFORE the 75C target, no grace", limits()[0] < 600.0, limits())
+check("...sized by the predicted overshoot (+7C -> 50%): 300 W", limits()[0] == 300.0, limits())
+ctl, gov = rise([70, 71, 72, 73, 74])   # 0.5 C/s
+check("slow climb (0.5 C/s): no prediction, nothing below the target", limits()[0] == 600.0, limits())
+ctl, gov = rise([74, 73, 74, 73, 74])   # flicker
+check("1 C flicker at 74C: no prediction, no cut", limits()[0] == 600.0, limits())
+ctl, gov = rise([50, 60])          # 5 C/s but 15 C below target
+check("fast rise more than 10C below the target: ignored", limits()[0] == 600.0, limits())
+ctl, gov = rise([64, 70, 76])      # predictive cut at 70 (reference 82), then 76
+check("after a predictive cut, 76C (below the predicted 82C) is HELD, not cut again",
+      limits()[0] == 300.0, limits())
+ctl, gov = rise([60, 66, 72], target=75, profile="adaptive:60")   # fans climb 10%/tick, not yet at 60
+check("adaptive: prediction alone doesn't cut while the fans are below the fan max",
+      limits()[0] == 600.0 or max(fans()) >= 60, (limits(), fans()))
+
+print("\n== grace only when STEADY; prediction per reading (pve-ai cold-start replay) ==")
+ctl, gov, *_ = rig(saved={"profile": "quiet", "target": "80"})
+set_temp(80, 50)
+ctl.update(); CLOCK.advance(2.0); ctl.update(); CLOCK.advance(2.0); ctl.update()
+check("steady AT the target keeps the 5 s grace (no cut at 4 s)", limits()[0] == 600.0, limits())
+CLOCK.advance(2.0); ctl.update()
+check("...and is cut once the grace runs out (-30 W)", limits()[0] == 570.0, limits())
+ctl, gov = rise([66, 67, 69, 70, 72])       # the real cold run: +2 C at 70 -> 72
+check("cold-run replay: +2C in one reading at 72C predicts 76C -> cut BEFORE the 75C target",
+      limits()[0] == 540.0, limits())
+ctl, gov = rise([72, 73, 74, 75])           # slow climb, 1C per reading
+check("slow climb 73 -> 74 -> 75: at the target and still climbing -> cut at once (-30 W)",
+      limits()[0] == 570.0, limits())
+ctl, gov = rise([75, 74, 75, 74, 75])       # flicker around the target
+check("a 1C flicker around the target (75, 74, 75 ...) is steady -> no cut", limits()[0] == 600.0,
+      limits())
 
 # ───────────────────────────────────────────────────────────────────────────
 print("\n== adaptive: holds AT the target, fan max, cut at fans >= max ==")
@@ -421,6 +551,73 @@ check("exit with a ceiling holds the ceiling", limits() == [300.0, 300.0], limit
 ctl.restore_auto_control()
 check("exit hands the fans back to the factory", policies() == [FACTORY, FACTORY])
 
+
+print("\n== unreadable temperatures fail safe (deploy-team review #1) ==")
+ctl, gov, *_ = rig(saved={"profile": "quiet", "ceiling": "300"})
+set_temp(60, 60)
+tick(ctl, 2)
+nv.DEVS[1].temp_fail = True
+tick(ctl, 2)
+check("two unreadable readings: tolerated, power unchanged", limits() == [300.0, 300.0], limits())
+tick(ctl, 1)
+check("third unreadable reading: BLIND -> every GPU to minimum power", limits() == [150.0, 150.0],
+      limits())
+check("...and the fans we own go to 100%", fans() == [100, 100], fans())
+nv.DEVS[1].temp_fail = False
+tick(ctl, 10)
+check("readable again: held for 30 s", limits() == [150.0, 150.0] and gov.blind_active, limits())
+tick(ctl, 10)
+check("released after 30 s of good readings", not gov.blind_active)
+tick(ctl, 17)
+check("...and power walks back up +20 W (conservative)", limits()[0] == 170.0, limits())
+ctl, gov, *_ = rig()                       # native, mirror off
+for d in nv.DEVS:
+    d.temp_fail = True
+nv.FAN_CALLS.clear()
+tick(ctl, 4)
+check("native + mirror off, blind: power cut, fans left to the factory curve",
+      limits() == [150.0, 150.0] and nv.FAN_CALLS == [], (limits(), nv.FAN_CALLS))
+
+print("\n== --power-dry-run is power-only again (review #4) ==")
+nv.reset(2)
+state, run = tempfile.mkdtemp(), tempfile.mkdtemp()
+write(state, "profile", "max")
+write(state, "ceiling", "250")
+store = nfc.SettingsStore(state, run, {})
+gov = nfc.PowerGovernor(handles=[], interval=5.0, dry_run=True)
+ctl = nfc.FanController(store, gov, emergency_c=92, state_dir=state, run_dir=run, dry_run=False)
+ctl.init()
+tick(ctl, 2)
+check("power-only dry run: no power writes", nv.SET_CALLS == [], nv.SET_CALLS)
+check("...but the fans run normally", fans() == [100, 100], fans())
+args = nfc.build_parser().parse_args(["--power-dry-run"])
+check("--power-dry-run no longer sets the full --dry-run", args.power_dry_run and not args.dry_run)
+
+print("\n== a bad runtime-state file can't crash-loop the daemon (review #5) ==")
+for bad in ('[1, 2, 3]', '{"adaptive": {"target_c": "hot", "trim_pct": -5}}', '{"adaptive": "x"}',
+            'not json'):
+    nv.reset(2)
+    state, run = tempfile.mkdtemp(), tempfile.mkdtemp()
+    write(state, "profile", "adaptive")
+    write(state, "target", "80")
+    with open(os.path.join(state, nfc.RUNTIME_STATE_FILE), "w") as f:
+        f.write(bad)
+    try:
+        c = nfc.FanController(nfc.SettingsStore(state, run, {}), nfc.PowerGovernor(handles=[], interval=5.0),
+                              emergency_c=92, state_dir=state, run_dir=run)
+        c.init()
+        ok = (not os.path.exists(os.path.join(state, nfc.RUNTIME_STATE_FILE))
+              and os.path.exists(os.path.join(state, nfc.RUNTIME_STATE_FILE + ".bad")))
+        check(f"bad state {bad[:28]!r}: starts, file set aside as .bad", ok)
+    except Exception as e:
+        check(f"bad state {bad[:28]!r}: starts, file set aside as .bad", False, e)
+
+print("\n== a stop requested during init() is honoured (review #6) ==")
+ctl, gov, *_ = rig(saved={"ceiling": "300"})
+ctl.stop()                                   # SIGTERM arrived while starting up
+nv.FAN_CALLS.clear()
+ctl.run()
+check("run() returns at once instead of starting the loop", nv.FAN_CALLS == [] and not ctl.running)
 
 # ───────────────────────────────────────────────────────────────────────────
 print("\n== dry run touches nothing ==")

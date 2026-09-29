@@ -37,6 +37,7 @@ class _Dev:
         self.temp = 40
         self.policy = NVML_FAN_POLICY_TEMPERATURE_CONTINOUS_SW
         self.manual_fan = 30
+        self.temp_fail = False
 
     @property
     def fan(self):
@@ -65,7 +66,10 @@ def nvmlDeviceGetCount(): return len(DEVS)
 def nvmlDeviceGetHandleByIndex(i): return DEVS[i]
 def nvmlDeviceGetName(h): return "FAKE RTX PRO 6000"
 def nvmlDeviceGetNumFans(h): return 2
-def nvmlDeviceGetTemperature(h, sensor): return h.temp
+def nvmlDeviceGetTemperature(h, sensor):
+    if h.temp_fail:
+        raise NVMLError("temperature read failed")
+    return h.temp
 def nvmlDeviceGetFanSpeed_v2(h, fan): return h.fan
 
 

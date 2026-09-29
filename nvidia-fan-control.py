@@ -116,16 +116,54 @@ TEMP_TARGET_MIN_C = 50
 
 
 # ─────────────────────────── THERMAL POWER ───────────────────────────
-# The temperature target is held by cutting GPU power once the card is at target +
-# MARGIN for a dwell. A 2 C overshoot for up to 5 s is accepted by design. With the fixed
-# curves the fan speed is irrelevant; with adaptive the fans must also be at its fan max.
-THERMAL_POWER_MARGIN_C = 2
+# The temperature target is held by cutting GPU power once the card is AT the target for a
+# short grace. With the fixed curves the fan speed is irrelevant; with adaptive the fans
+# must also be at its fan max (fans first, then power).
+#
+# The cut is EXPONENTIAL in degrees over the target (operator, 2026-09-29):
+#     step = MIN_STEP x 2^(degrees over target), at most MAX_STEP_FRACTION of power
+#     at target: -30 W   +1 C: -60 W   +2 C: -120 W   +3 C: -240 W   +4 C and up: -50% of power
+# The first cut waits INITIAL_DWELL_S (the grace), except at SKIP_DWELL_EXCESS_C or more
+# over the target, where it cuts on that reading. While the card is still FALLING (cooler
+# than one repeat dwell ago), power is HELD: temperature lags a cut by a few seconds, and
+# cutting again before the last cut has taken effect overshoots downwards. Once it stops
+# falling and is still at or over the target, it's cut again. (Comparing with the
+# temperature AT the cut let a card plateau over the cut point forever; seen on pve-ai.)
+#
+# History: the cut point was target+2 C with 20 W linear steps. On pve-ai at 600 W a card
+# overshot to 78 C against a 72 C cut point; the operator moved the cut to the target, made
+# it exponential, and raised the base step to 30 W.
+THERMAL_POWER_MARGIN_C = 0            # the cut point is the target itself
 THERMAL_POWER_INITIAL_DWELL_S = 5.0
 THERMAL_POWER_REPEAT_DWELL_S = 5.0
-THERMAL_POWER_MIN_STEP_W = 20.0
-THERMAL_POWER_MAX_STEP_W = 150.0
-THERMAL_POWER_W_PER_EXCESS_C = 10.0
+THERMAL_POWER_MIN_STEP_W = 30.0
+THERMAL_POWER_MAX_STEP_FRACTION = 0.5
+THERMAL_POWER_SKIP_DWELL_EXCESS_C = 4 # target+4 C or more: no grace
+# Rate of rise (operator, 2026-09-29). Measured PER READING, not per second: readings are
+# nominally 2 s apart but really ~2.05 s, so a per-second threshold of 1.0 C/s silently
+# rejected a real +2 C-per-reading climb (seen on pve-ai).
+#   * Prediction, at the ONSET of a hold: if the card rose >= RATE_FAST_C_PER_READING since
+#     the last reading and is within RATE_WINDOW_C of the target, the decision uses
+#         predicted = now + (rise per reading) x RATE_LOOKAHEAD_READINGS
+#     and cuts as soon as the prediction reaches the target, sized by the predicted
+#     overshoot. Only for the first cut: afterwards the real-temperature rules run.
+#   * Grace only when STEADY: at or over the target, if the card is warmer than it was
+#     two readings ago (still climbing), it's cut without waiting. The 5 s grace is kept
+#     for a card that has reached the target and stopped climbing. Two readings, not one,
+#     so a 1 C flicker (74, 75, 74, 75) still counts as steady.
+THERMAL_RATE_FAST_C_PER_READING = 2
+THERMAL_RATE_LOOKAHEAD_READINGS = 2
+THERMAL_RATE_WINDOW_C = 10
+# The target must leave room below the emergency temperature, so the normal cut always
+# comes first. Independent of the margin above.
+TEMP_TARGET_EMERGENCY_GAP_C = 3
 THERMAL_POWER_RECOVER_MARGIN_C = 2
+# Recovery mirrors the cut (operator, 2026-09-29): once a hold is released, each raise is
+#     step = POWER_SLEW_UP_W x 2^(degrees below target - RECOVER_MARGIN), at most MAX_STEP_FRACTION
+# of current power, one raise per POWER_RESTORE_DWELL_S. A card sitting just under the
+# release point creeps up +20 W; one that has clearly cooled gets its power back fast. With
+# a UPS budget, a raise is also bounded by the measured headroom. After an EMERGENCY,
+# recovery stays at the conservative +20 W: that hold means something went badly wrong.
 THERMAL_POWER_RECOVER_DWELL_S = 30.0
 
 # ── emergency cutoff: always armed, for every profile ──
@@ -138,6 +176,12 @@ TEMP_EMERGENCY_MAX_C = 95
 EMERGENCY_DWELL_S = 2.0
 EMERGENCY_RELEASE_DROP_C = 30
 EMERGENCY_RELEASE_DWELL_S = 30.0
+# If any card's temperature can't be read for this many consecutive readings, the
+# governor is blind: every GPU goes to its minimum power and the fans we own go to 100%
+# (native fans stay with the factory curve, which reads the sensor itself). Released once
+# every card reads again for BLIND_RELEASE_DWELL_S; power then walks back up in +20 W steps.
+BLIND_READ_FAILURES = 3
+BLIND_RELEASE_DWELL_S = 30.0
 
 
 # ─────────────────────────── UPS BUDGET ───────────────────────────
@@ -563,7 +607,15 @@ class PowerGovernor:
         self._thermal_hot_since: Optional[float] = None
         self._thermal_cool_since: Optional[float] = None
         self._last_thermal_step = 0.0
+        self._last_cut_temp_c: Optional[int] = None
+        self._last_hottest_c: Optional[int] = None
+        self._recent_c: List[int] = []                          # last 3 readings, oldest first
+        self._target_c: Optional[int] = None
+        self._conservative_recovery = False     # after an emergency: +20 W steps only
         self.thermal_limited = False
+        # temperature unreadable
+        self.blind_active = False
+        self._blind_ok_since: Optional[float] = None
         # emergency cutoff
         self.emergency_active = False
         self._emergency_hot_since: Optional[float] = None
@@ -671,7 +723,7 @@ class PowerGovernor:
             self._hold_ceiling()
 
     def _holding(self) -> bool:
-        return self.emergency_active or self.thermal_limited
+        return self.emergency_active or self.thermal_limited or self.blind_active
 
     def _release_to_default(self, source: str):
         """Hand the cards back to their default limit (no ceiling, no UPS budget).
@@ -688,6 +740,17 @@ class PowerGovernor:
         log.info(f"POWER: no ceiling and no UPS budget ({source}) — GPUs at their "
                  "default limit " + "/".join(f"{w:.0f}" for w in self.applied_w) + "W")
 
+    def raise_step_w(self) -> float:
+        """How much one upward step may add: exponential in degrees below the release point."""
+        if (self._conservative_recovery or self._target_c is None
+                or self._last_hottest_c is None or self.learned_cap_w is None):
+            return POWER_SLEW_UP_W
+        below_c = (self._target_c - THERMAL_POWER_RECOVER_MARGIN_C) - self._last_hottest_c
+        if below_c <= 0:
+            return POWER_SLEW_UP_W
+        step = POWER_SLEW_UP_W * (2 ** min(below_c, 16))
+        return max(POWER_SLEW_UP_W, min(step, THERMAL_POWER_MAX_STEP_FRACTION * self.learned_cap_w))
+
     def _walk_step(self, now: float) -> bool:
         """One recovery-walk step towards the walk target. Returns True when it's done."""
         if self.learned_cap_w is None:
@@ -697,13 +760,17 @@ class PowerGovernor:
             return True
         if now - self._last_limit_change < POWER_RESTORE_DWELL_S:
             return False
-        self.learned_cap_w = min(top, self.learned_cap_w + POWER_SLEW_UP_W)
+        step = self.raise_step_w()
+        self.learned_cap_w = min(top, self.learned_cap_w + step)
         for i in range(len(self.handles)):
             self._set_limit(i, min(self._walk_targets()[i], self.learned_cap_w))
         self._last_limit_change = now
-        log.info(f"POWER: recovering after a hold, +{POWER_SLEW_UP_W:.0f} W -> "
+        log.info(f"POWER: recovering after a hold, +{step:.0f} W -> "
                  + "/".join(f"{w:.0f}" for w in self.applied_w) + "W")
-        return self.learned_cap_w >= top - 0.5
+        done = self.learned_cap_w >= top - 0.5
+        if done:
+            self._conservative_recovery = False
+        return done
 
     def _walk_targets(self) -> List[float]:
         if self.ceiling_w is not None:
@@ -715,7 +782,7 @@ class PowerGovernor:
     def _hold_ceiling(self):
         """No UPS budget: park every GPU on its cap. Idempotent; logs on change."""
         now = time.monotonic()
-        if self.emergency_active:
+        if self.emergency_active or self.blind_active:
             targets = list(self.min_w)
         elif self.thermal_limited and self.learned_cap_w is not None:
             targets = [min(t, self.learned_cap_w) for t in self._walk_targets()]
@@ -822,6 +889,7 @@ class PowerGovernor:
                 return
             self.emergency_active = True
             self.recovery_walk = False
+            self._conservative_recovery = True
             self.clamp_all(min(self.min_w),
                            f"EMERGENCY: {hottest_c}C >= {emergency_c}C for {hot_for:.0f}s")
             log.warning(f"⚠ EMERGENCY: all GPUs at minimum power; released once <= "
@@ -862,9 +930,14 @@ class PowerGovernor:
         fresh-UPS-feedback gate as a UPS step, so one stale whole-system reading can't make
         both inputs react.
         """
+        self._last_hottest_c = hottest_c
+        self._target_c = target_c
+        now = time.monotonic()
+        self._recent_c = (self._recent_c + [hottest_c])[-3:]
+        rise_c = hottest_c - self._recent_c[-2] if len(self._recent_c) >= 2 else 0
+        climbing = len(self._recent_c) >= 3 and hottest_c > self._recent_c[-3]
         if self.learned_cap_w is None or not self.min_w or self.emergency_active:
             return
-        now = time.monotonic()
         if target_c is None:
             if self.thermal_limited:
                 self.thermal_limited = False
@@ -877,23 +950,40 @@ class PowerGovernor:
 
         trigger_c = target_c + THERMAL_POWER_MARGIN_C
         fans_ok = fan_threshold is None or (fan_pct is not None and fan_pct >= fan_threshold)
-        thermally_over = hottest_c >= trigger_c and fans_ok
+        # rate of rise: only at the onset (not already holding), only when clearly fast
+        predicted_c = None
+        if (not self.thermal_limited
+                and rise_c >= THERMAL_RATE_FAST_C_PER_READING
+                and hottest_c >= trigger_c - THERMAL_RATE_WINDOW_C):
+            predicted_c = hottest_c + rise_c * THERMAL_RATE_LOOKAHEAD_READINGS
+        predictive = predicted_c is not None and predicted_c >= trigger_c
+        effective_c = max(hottest_c, predicted_c) if predictive else hottest_c
+        thermally_over = effective_c >= trigger_c and fans_ok
 
         if thermally_over:
             self._thermal_cool_since = None
+            excess_c = max(0, effective_c - trigger_c)
+            no_grace = predictive or climbing or excess_c >= THERMAL_POWER_SKIP_DWELL_EXCESS_C
             if self._thermal_hot_since is None:
                 self._thermal_hot_since = now
-                return
+                if not no_grace:
+                    return          # steady at the target: wait the grace
             hot_for = now - self._thermal_hot_since
-            required_dwell = (THERMAL_POWER_REPEAT_DWELL_S if self.thermal_limited
-                              else THERMAL_POWER_INITIAL_DWELL_S)
-            if (hot_for < required_dwell
-                    or (self.thermal_limited and now - self._last_thermal_step < required_dwell)):
+            if self.thermal_limited:
+                if now - self._last_thermal_step < THERMAL_POWER_REPEAT_DWELL_S:
+                    return
+                if self._last_cut_temp_c is not None and hottest_c < self._last_cut_temp_c:
+                    # still falling: hold, and compare with THIS reading next time, so a
+                    # card that stops falling above the cut point gets cut again
+                    self._last_cut_temp_c = hottest_c
+                    self._last_thermal_step = now
+                    return
+            elif hot_for < THERMAL_POWER_INITIAL_DWELL_S and not no_grace:
                 return
             before = tuple(self.applied_w)
-            excess_c = max(0, hottest_c - trigger_c)
             step_w = max(THERMAL_POWER_MIN_STEP_W,
-                         min(THERMAL_POWER_MAX_STEP_W, excess_c * THERMAL_POWER_W_PER_EXCESS_C))
+                         min(THERMAL_POWER_MIN_STEP_W * (2 ** excess_c),
+                             THERMAL_POWER_MAX_STEP_FRACTION * self.learned_cap_w))
             new_cap = max(min(self.min_w), self.learned_cap_w - step_w)
             self.learned_cap_w = new_cap
             for i in range(len(self.handles)):
@@ -902,6 +992,7 @@ class PowerGovernor:
             self.recovery_walk = False
             self._thermal_hot_since = now
             self._last_thermal_step = now
+            self._last_cut_temp_c = effective_c   # the predicted peak, when it was predictive
             self._last_limit_change = now
             if tuple(self.applied_w) != before and self._last_ups_reading is not None:
                 total_w, status_flags = self._last_ups_reading
@@ -909,8 +1000,12 @@ class PowerGovernor:
                 self._feedback_wait_status_flags = status_flags
                 self._feedback_wait_since = now
             fans = f" at {fan_pct}% fan" if fan_pct is not None else ""
-            log.warning(f"⚠ THERMAL: {hottest_c}C{fans} for {hot_for:.0f}s (target {target_c}C, "
-                        f"cut at {trigger_c}C) -> -{step_w:.0f} W, power cap {new_cap:.0f} W")
+            why = (f"rising {rise_c}C/reading, predicted {predicted_c}C"
+                   if predictive and predicted_c > hottest_c
+                   else "still climbing, no grace" if climbing and hot_for < 1.0
+                   else f"for {hot_for:.0f}s")
+            log.warning(f"⚠ THERMAL: {hottest_c}C{fans}, {why} (target {target_c}C, "
+                        f"+{excess_c}C over) -> -{step_w:.0f} W, power cap {new_cap:.0f} W")
             if new_cap <= min(self.min_w) + 0.5 and hottest_c >= trigger_c:
                 log.warning("⚠ THERMAL: already at the hardware power floor and still over the "
                             "target — only the fan profile or the card's own limits can help now")
@@ -929,6 +1024,7 @@ class PowerGovernor:
             if cool_for >= THERMAL_POWER_RECOVER_DWELL_S:
                 self.thermal_limited = False
                 self._thermal_cool_since = None
+                self._last_cut_temp_c = None
                 self.recovery_walk = True
                 self._last_limit_change = now
                 log.info(f"THERMAL: {hottest_c}C <= {release_c}C for {cool_for:.0f}s -> "
@@ -936,10 +1032,39 @@ class PowerGovernor:
         else:
             self._thermal_cool_since = None
 
+    def observe_blind(self, blind: bool):
+        """Temperatures unreadable: fail safe to minimum power; release after a good dwell."""
+        if not self.min_w:
+            return
+        now = time.monotonic()
+        if blind:
+            self._blind_ok_since = None
+            if not self.blind_active:
+                self.blind_active = True
+                self.recovery_walk = False
+                self._conservative_recovery = True
+                self.clamp_all(min(self.min_w), "BLIND: GPU temperature unreadable")
+            for i in range(len(self.handles)):
+                self._set_limit(i, self.min_w[i])
+            return
+        if not self.blind_active:
+            return
+        if self._blind_ok_since is None:
+            self._blind_ok_since = now
+            return
+        if now - self._blind_ok_since >= BLIND_RELEASE_DWELL_S:
+            self.blind_active = False
+            self._blind_ok_since = None
+            self.recovery_walk = True
+            self._last_limit_change = now
+            log.info("BLIND: temperatures readable again for "
+                     f"{BLIND_RELEASE_DWELL_S:.0f}s -> cleared; power walks back up")
+
     def restore_holds(self, thermal: bool, emergency: bool):
         """Re-arm holds saved in the runtime state (a restart must not lift them)."""
         if emergency:
             self.emergency_active = True
+            self._conservative_recovery = True
             self.clamp_all(min(self.min_w), "EMERGENCY hold restored from runtime state")
         if thermal:
             self.thermal_limited = True
@@ -954,8 +1079,8 @@ class PowerGovernor:
 
         self.enforce_ceiling()
 
-        if self.emergency_active:
-            log.info("POWER: EMERGENCY hold, limits "
+        if self.emergency_active or self.blind_active:
+            log.info(f"POWER: {'EMERGENCY' if self.emergency_active else 'BLIND'} hold, limits "
                      + "/".join(f"{w:.0f}" for w in self.applied_w) + "W")
             return
 
@@ -1078,6 +1203,7 @@ class PowerGovernor:
             if self.learned_cap_w >= max_common_cap:
                 self._headroom_ticks = 0
                 self.recovery_walk = False
+                self._conservative_recovery = False
                 log.info(f"POWER: ups={total_w:.0f}W gpu={gpu_draw:.0f}W other={non_gpu:.0f}W "
                          f"budget={self.budget_w:.0f}W -> headroom, already at MAX "
                          + "/".join(f"{w:.0f}" for w in self.applied_w) + "W")
@@ -1098,7 +1224,10 @@ class PowerGovernor:
                          f"{since_change:.0f}/{POWER_RESTORE_DWELL_S:.0f}s; learned limits held "
                          + "/".join(f"{w:.0f}" for w in self.applied_w) + "W")
                 return
-            target = min(max_common_cap, self.learned_cap_w + POWER_SLEW_UP_W)
+            headroom_w = (self.budget_w - POWER_RESTORE_MARGIN_W) - total_w
+            raise_w = max(POWER_SLEW_UP_W, min(self.raise_step_w(),
+                                               headroom_w / max(1, active_gpu_count)))
+            target = min(max_common_cap, self.learned_cap_w + raise_w)
             self._headroom_ticks = 0
             mode = "restore"
 
@@ -1117,7 +1246,7 @@ class PowerGovernor:
             if delta < 0:
                 want = cur - min(-delta, POWER_SLEW_DOWN_W)
             else:
-                want = cur + min(delta, POWER_SLEW_UP_W)
+                want = cur + min(delta, raise_w if mode == "restore" else POWER_SLEW_UP_W)
             self._set_limit(i, want)
 
         if tuple(self.applied_w) != limits_before:
@@ -1135,33 +1264,28 @@ class PowerGovernor:
                  + "/".join(f"{w:.0f}" for w in self.applied_w) + "W")
 
     def restore_defaults(self):
-        """On exit. A pinned ceiling outlives the process (`nvidia-smi -pl` semantics), and
-        so does a thermal or emergency hold: stopping the service must never RAISE power
-        on a hot card."""
+        """On exit: never RAISE any card's power.
+
+        A pinned ceiling outlives the process (`nvidia-smi -pl` semantics), and so does
+        anything that lowered a card: a thermal or emergency hold, the blind fail-safe, a UPS
+        on-battery floor, the fallback clamp, a UPS-budget trim. Stopping the service must not
+        undo those; the next start re-evaluates. Each card ends at the lower of its current
+        limit and what it would otherwise be restored to (its ceiling, or its default).
+        """
         if self.dry_run:
             return
-        if self._holding():
-            log.info("Power hold active (" + ("EMERGENCY" if self.emergency_active else "thermal")
-                     + ") — leaving the lowered limits in place: "
-                     + "/".join(f"{w:.0f}" for w in self.applied_w) + " W")
-            return
-        if self.ceiling_w is not None:
-            log.info("Power ceiling active — leaving GPUs pinned instead of restoring "
-                     "card defaults (unpin by writing 'none' to the ceiling file)")
-            for i, h in enumerate(self.handles):
-                try:
-                    pynvml.nvmlDeviceSetPowerManagementLimit(h, int(self.ceiling_w[i] * 1000))
-                    log.info(f"  GPU {i}: held at {self.ceiling_w[i]:.0f} W")
-                except pynvml.NVMLError as e:
-                    log.error(f"  GPU {i}: could not hold ceiling: {e}")
-            return
-        log.info("Restoring default GPU power limits...")
         for i, h in enumerate(self.handles):
+            restore_to = self.ceiling_w[i] if self.ceiling_w is not None else self.default_w[i]
+            final = min(self.applied_w[i], restore_to)
+            why = ("ceiling" if self.ceiling_w is not None and final >= restore_to - 0.5
+                   else "default" if final >= restore_to - 0.5 else "kept lowered")
             try:
-                pynvml.nvmlDeviceSetPowerManagementLimit(h, int(self.default_w[i] * 1000))
-                log.info(f"  GPU {i}: restored to {self.default_w[i]:.0f} W")
+                current = pynvml.nvmlDeviceGetPowerManagementLimit(h) / 1000.0
+                if abs(current - final) >= 1.0:
+                    pynvml.nvmlDeviceSetPowerManagementLimit(h, int(final * 1000))
+                log.info(f"  GPU {i}: power left at {final:.0f} W ({why})")
             except pynvml.NVMLError as e:
-                log.error(f"  GPU {i}: could not restore power limit: {e}")
+                log.error(f"  GPU {i}: could not settle power limit: {e}")
 
 
 # ─────────────────────────── FAN CONTROLLER ───────────────────────────
@@ -1202,7 +1326,9 @@ class FanController:
         self.last_temps: Dict[int, int] = {}
         self.messages: List[str] = []
         self._written_generation = -1
-        self.running = False
+        self._read_failures = 0
+        # set here, not in run(): a stop requested during init() must be honoured (#6)
+        self.running = True
         self._last_runtime_save = 0.0
 
     # ── setup ──
@@ -1237,7 +1363,7 @@ class FanController:
     def _apply(self, changes, masked, startup: bool = False):
         by_name = {name: (value, source) for name, value, source in changes}
         for name, value, source in masked:
-            text = format_setting(name, value)
+            text = value.describe() if name == "profile" else format_setting(name, value)
             live, _ = self.store.resolve(name)
             what = {"profile": "FAN: profile", "mirror": "FAN: mirror",
                     "target": "TEMP: target", "ceiling": "POWER: ceiling"}[name]
@@ -1269,10 +1395,10 @@ class FanController:
             self._resolve_profile(describe_source(self.store, "profile", source), startup)
 
     def _set_target(self, value: Optional[int], source: str):
-        highest = self.emergency_c - THERMAL_POWER_MARGIN_C - 1
+        highest = self.emergency_c - TEMP_TARGET_EMERGENCY_GAP_C
         if value is not None and value > highest:
             self._note(f"TEMP: ignoring target {value}C ({source}) — it must be at most "
-                       f"{highest}C, so the target+{THERMAL_POWER_MARGIN_C}C cut comes before the "
+                       f"{highest}C, so the power cut comes well before the "
                        f"{self.emergency_c}C emergency; keeping "
                        + (f"{self.target}C" if self.target is not None else "no target"), True)
             return
@@ -1283,8 +1409,9 @@ class FanController:
             self._note(f"TEMP: target cleared ({source})")
         else:
             self._note(f"TEMP: target set to {value}C ({source}); power is cut at "
-                       f"{value + THERMAL_POWER_MARGIN_C}C held for "
-                       f"{THERMAL_POWER_INITIAL_DWELL_S:.0f}s")
+                       f"{value + THERMAL_POWER_MARGIN_C}C after a "
+                       f"{THERMAL_POWER_INITIAL_DWELL_S:.0f}s grace (none at "
+                       f"{value + THERMAL_POWER_SKIP_DWELL_EXCESS_C}C+)")
 
     def _resolve_profile(self, source: str, startup: bool):
         want = self.requested_profile
@@ -1331,6 +1458,9 @@ class FanController:
             except pynvml.NVMLError as e:
                 log.error(f"GPU {gpu}: Error reading temperature: {e}")
         return temps
+
+    def _fans_owned(self) -> bool:
+        return not (self.profile.name == "native" and not self.mirror)
 
     def _read_speed(self, gpu: int) -> Optional[int]:
         try:
@@ -1411,8 +1541,28 @@ class FanController:
         if changes or masked or self.store.generation != self._written_generation:
             self._write_effective()
         temps = self._read_temps()
-        if not temps:
-            return
+        if len(temps) < len(self.handles):
+            # Fail safe (#1): a card we can't read might be the hot one. One bad reading is
+            # tolerated; after BLIND_READ_FAILURES in a row the governor goes blind.
+            self._read_failures += 1
+            if self._read_failures >= BLIND_READ_FAILURES:
+                if self._read_failures == BLIND_READ_FAILURES:
+                    log.warning(f"⚠ BLIND: {len(self.handles) - len(temps)} GPU temperature(s) "
+                                f"unreadable for {self._read_failures} readings -> minimum power"
+                                + ("; fans 100%" if self._fans_owned() else
+                                   "; native fans stay on the factory curve"))
+                self.governor.observe_blind(True)
+                if self._fans_owned():
+                    for gpu in range(len(self.handles)):
+                        self._set_speed(gpu, 100)
+                return
+            if not temps:
+                return
+        else:
+            if self._read_failures >= BLIND_READ_FAILURES:
+                log.info("BLIND: all GPU temperatures readable again")
+            self._read_failures = 0
+            self.governor.observe_blind(False)
         self.last_temps = temps
         hottest = max(temps.values())
         self.governor.observe_emergency(hottest, self.emergency_c)
@@ -1522,14 +1672,25 @@ class FanController:
         return os.path.join(self.state_dir, RUNTIME_STATE_FILE)
 
     def _restore_runtime_state(self):
+        """Restore learned state. A bad file must never stop the daemon starting (#5): it is
+        set aside as <file>.bad and the daemon starts fresh."""
+        path = self._runtime_path()
         try:
-            with open(self._runtime_path()) as f:
+            with open(path) as f:
                 state = json.load(f)
+            if not isinstance(state, dict):
+                raise ValueError("not a JSON object")
+            self._apply_runtime_state(state)
         except FileNotFoundError:
             return
-        except (OSError, ValueError) as e:
-            log.warning(f"⚠ runtime state unreadable ({e}); starting fresh")
-            return
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as e:
+            log.warning(f"⚠ runtime state {path} unusable ({e}); set aside, starting fresh")
+            try:
+                os.replace(path, path + ".bad")
+            except OSError:
+                pass
+
+    def _apply_runtime_state(self, state: dict):
         age = time.time() - float(state.get("saved_at", 0))
         adaptive = state.get("adaptive") or {}
         if adaptive.get("target_c") is not None and adaptive.get("trim_pct") is not None:
@@ -1618,7 +1779,6 @@ class FanController:
                     log.error(f"  GPU {gpu} Fan {fan}: could not restore: {e}")
 
     def run(self):
-        self.running = True
         log.info("Fan control + GPU power governor running.")
         try:
             while self.running:
@@ -1825,8 +1985,11 @@ def build_parser() -> argparse.ArgumentParser:
     run = parser.add_argument_group("running")
     run.add_argument("--interval", "-i", type=float, default=2.0, help="Fan poll interval (s)")
     run.add_argument("--once", action="store_true", help="One tick, then exit")
-    run.add_argument("--dry-run", "--power-dry-run", dest="dry_run", action="store_true",
+    run.add_argument("--dry-run", action="store_true",
                      help="Log what would change (fans and power); touch nothing")
+    run.add_argument("--power-dry-run", action="store_true",
+                     help="Power governor only: log the power limits it WOULD set, while fans, "
+                          "and everything else, run normally")
     run.add_argument("--clear-override", action="store_true",
                      help="Remove temporary overrides held by the running daemon")
     run.add_argument("--reset-fans", action="store_true",
@@ -1911,7 +2074,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     store = SettingsStore(args.state_dir, args.run_dir, cli)
     governor = PowerGovernor(handles=[], budget_w=args.power_budget, ups_name=args.ups,
                              interval=args.power_interval, fallback_w=args.power_fallback,
-                             floor_on_flags=args.power_floor_on, dry_run=args.dry_run)
+                             floor_on_flags=args.power_floor_on,
+                             dry_run=args.dry_run or args.power_dry_run)
     controller = FanController(store, governor, poll_interval=args.interval,
                                emergency_c=args.temp_emergency, state_dir=args.state_dir,
                                run_dir=args.run_dir, dry_run=args.dry_run)

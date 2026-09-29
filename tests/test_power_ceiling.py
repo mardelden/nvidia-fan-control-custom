@@ -130,9 +130,23 @@ g = make(ceiling=[300.0])
 g.restore_defaults()
 check("a ceiling outlives the process", limits() == [300.0, 300.0], limits())
 g = make(budget=900.0)
-nv.DEVS[0].limit = 200.0
 g.restore_defaults()
-check("no ceiling, no hold: card defaults restored", limits() == [600.0, 600.0], limits())
+check("no ceiling, nothing lowered: cards left at their default", limits() == [600.0, 600.0], limits())
+g = make(budget=900.0, ceiling=[300.0])
+g.ups.read = lambda: (400.0, ("OB", "DISCHRG"))
+busy(200.0)
+g.update(force=True)
+g.restore_defaults()
+check("stop during a UPS on-battery floor keeps 150 W (never raised to the 300 W ceiling)",
+      limits() == [150.0, 150.0], limits())
+g = make(budget=900.0)
+g.ups.read = lambda: (1000.0, ("OL",))
+busy(350.0)
+g.update(force=True)
+trimmed = limits()[0]
+g.restore_defaults()
+check("stop after a UPS-budget trim keeps the trimmed limit (not raised to 600)",
+      limits()[0] == trimmed and trimmed < 600.0, limits())
 g = make(ceiling=[300.0])
 g.thermal_limited = True
 for d in nv.DEVS:
