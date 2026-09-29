@@ -1,6 +1,6 @@
 # Plan: Live fan profile, mirror setting and temperature target
 
-**Status:** Proposed
+**Status:** Implemented in this repo and hardware-tested on pve-ai (2026-09-29). Awaiting the deploy team's review and deploy.
 **Date:** 2026-09-29
 **Driven by:** gpuguard ADRs 004–011 (`~/src/gpuguard/plans/decisions/`); Part D of proxmox
 handover `gpuguard-infra-request-001`
@@ -272,3 +272,35 @@ for their review and deploy**. We don't deploy it ourselves.
 - **Resolved (2026-09-29):** the 92 °C override on `native` → the factory curve handles the
   fans, and the emergency *power* cutoff covers everyone (ADR 010). The hand-run fixes →
   temporary overrides, no saved-file writes, and a dry run that covers the fans (ADR 011).
+
+## Outcome (2026-09-29)
+
+**Implemented** in `nvidia-fan-control.py`. There are 116 fake-NVML assertions:
+`tests/test_fan_policy.py` (96) and `tests/test_power_ceiling.py` (20, ported to the new API).
+
+**Hardware test on pve-ai.** A hand-run with its own state and run dirs, so production state
+was never touched. Production service stopped for about 35 minutes, with a systemd safety-net
+timer. gpu-burn (deploy team, proxmox `134dc15`) in `gpu-test` provided the load.
+
+| # | Scenario | Result |
+|---|---|---|
+| 1 | Settings loaded from the files, with ack lines | ✅ |
+| 2 | Live profile / mirror switching; malformed input ignored; `native` hands off (policy read back from NVML) | ✅ |
+| 3 | `native` + target 65 under load: cut at 68 °C for 6 s → 280/260/240 W; the card held at 68 °C; fans untouched (factory 30 → 40%) | ✅ |
+| 4 | `adaptive:50` + target 65: fans never above 50%; cut at 67 °C with fans at 50% → 280 … 200 W; the S3 recovery walk visible (260 → 280 → 300) | ✅ |
+| 5 | Emergency at a test threshold of 70 °C: 150 W within one sample; `native` fans untouched; a live switch to `max` during the hold; release at 40 °C for 30 s; walk 150 → 170 W | ✅ |
+| 6 | A hand-run override while the daemon runs; a refused target rolled back; `--clear-override` | ✅ |
+| 7 | A clean stop saves the runtime state and leaves the ceiling; the restart resumes every setting | ✅ |
+| 8 | Crash (`kill -9`) with the fans at 100% | ❌ **the fans stay manual.** See `decisions/008`; fixed with `--reset-fans` as `ExecStopPost=` |
+
+Observations:
+
+- **At a 300 W ceiling, two cards at full load put total UPS load at ~870 W**, close to the
+  900 W budget.
+- **The thermal cut is a shared cap**, so both cards drop when the hottest one is over.
+- **The emergency release (emergency − 30) is slow when it's close to idle temperature.** At the
+  test threshold of 70 °C (release at 40 °C), the factory fans needed minutes; switching to `max`
+  released it in about 90 s. At the real 92 °C (release at 62 °C) it's far easier.
+- **The new script is a drop-in for the old unit.** Production's exact `ExecStart`
+  (`--mirror --temp-target 85 …`) gives adaptive + mirror on + target 85, which is today's
+  behaviour. So the deploy is safe in two steps: the daemon first, then the unit and the seed.

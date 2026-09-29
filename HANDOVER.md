@@ -1,238 +1,146 @@
-# HANDOVER — nvidia-fan-control + UPS power governor
+# HANDOVER — nvidia-fan-control (fan control + GPU power governor)
 
-Deployment contract for the fleet/infra team. **Facts to adapt, not an implementation
-to run** — the paths, unit name and install method below are what works on the dev box;
-port them to fleet conventions rather than copying them.
-
-Source: `github.com/mardelden/nvidia-fan-control-custom` (fork of `zmarty/nvidia-fan-control`)
-
----
+For whoever deploys and operates this daemon. On the Vulcandom fleet that's the deploy team,
+through the Ansible role `proxmox_host` (`--tags gpu-fan`) in `~/src/proxmox`. **The golden
+copy of the script is `roles/proxmox_host/files/nvidia-fan-control.py` in that repo**, and
+this repo is kept byte-identical to it (plans/decisions/007).
 
 ## What it is
 
-A single Python daemon that does two related things on a multi-GPU host:
+One process, run as root under systemd. It does two jobs, and they're in the same loop on
+purpose: cutting power lowers temperature, so two separate controllers would react to each
+other.
 
-1. **Fan control** — overrides the cards' factory fan curve; can sync all fans to the
-   hottest card (matters for back-to-back cards where an idle neighbour's slow fan
-   chokes the hot card's airflow).
-2. **Power governor** *(fork addition, optional)* — **reactive** closed-loop cap on
-   **total UPS load** by adjusting GPU power limits: full power until load *sustains*
-   over budget, then throttle; a brief spike passes through (the UPS carries a few
-   seconds of overshoot on surge/battery).
+- **Fan control:** a fan profile (`native` = the factory curve, left alone; `quiet`,
+  `aggressive`, `performance`, `max`; or `adaptive`, the learning controller), plus an
+  optional **mirror** for back-to-back cards.
+- **The GPU power governor:** the only thing that writes GPU power limits. It enforces the
+  operator's power ceiling and temperature target, and the host's UPS budget and emergency
+  temperature. **The UPS is a read-only input** (`upsc`, polled). It never commands the UPS
+  and never shuts the host down; that's NUT's `upsmon`.
 
-They share one process deliberately: capping power lowers temperature, so two
-independent controllers would react to each other's output.
+## The contract: live settings vs safety limits
 
-## How it runs
+**Operator settings are files, not flags.** The unit must NOT pass them:
 
-| | |
-|---|---|
-| Shape | long-running systemd service, `Type=simple`, `Restart=on-failure` |
-| User | **root** (required — NVML fan + power limit writes) |
-| Listener | **none** — no ports, no sockets, no network |
-| Health | liveness only: `systemctl is-active`. Journal lines are the real signal. |
-| Shutdown | handles `SIGTERM`; restores factory fan policy **and** default power limits on exit |
-| Resource | negligible — the fan-only version measured **49 ms CPU** total; no meaningful RAM |
-
-## Dependencies
-
-| Dependency | Why | Note |
+| File in `/var/lib/nvidia-fan-control/` | Values | Missing means |
 |---|---|---|
-| NVIDIA driver + NVML | fan + power control | must match the host driver, e.g. `580.126.18` |
-| `nvidia-persistenced` | keeps the driver loaded | daemon must start **after** it |
-| `python3-pynvml` | NVML bindings | `apt install python3-pynvml` |
-| **NUT client (`upsc`)** | power governor sensor only | not needed if `--power-budget` is omitted |
-| `nut-monitor.service` | provides `upsc` data | governor must start **after** it |
+| `fan-profile` | `native` `quiet` `aggressive` `performance` `max` `adaptive[:FANMAX]` | `native` |
+| `fan-mirror` | `on` `off` | `off` |
+| `temp-target` | °C, or `none` | no target |
+| `power-ceiling` | `W`, `W,W`, or `none` | the hardware max |
 
-Python: stdlib only besides `pynvml`. No venv, no pip install, no lockfile.
+Changes are picked up live (≤ 2 s; `systemctl reload` re-reads at once), and each one is
+acknowledged in the journal with a line starting `FAN:`, `TEMP:` or `POWER:`. **A line
+containing `ignoring` means the value was refused and the previous one is still in force.**
 
-## Startup ordering
+**Why the unit must not pass them:** a flag beats the file at every start (flag > override >
+saved). A flag in `ExecStart` would silently undo every live change at the next restart. That
+already happened once with `--power-ceiling` (proxmox `87b4b9a` → `0f802b4`).
 
-```
-nvidia-persistenced.service ─┐
-nut-monitor.service ─────────┴─→ nvidia-fan-control.service
-```
+**Safety limits stay as unit flags**, set per host and read-only in gpuguard:
 
-Both are `After=` **and** `Wants=`. If NUT is missing the governor fails safe (see
-below) rather than crashing, but the ordering avoids a noisy first minute.
-
-## Configuration contract
-
-**Config is CLI flags in `ExecStart`**, plus **one state file** for the power ceiling
-(`/var/lib/nvidia-fan-control/power-ceiling`, created by `StateDirectory=`). No env
-vars, no secrets — nothing to put in OpenBao.
-
-| Flag | Default | Meaning |
+| Flag | pve-ai | Meaning |
 |---|---|---|
-| `--mode` | `quiet` | fan curve: `native`, `quiet`, `aggressive`, `performance`, `max` |
-| `--interval` | `2.0` | fan loop period (seconds) |
-| `--independent` | off | per-card fans instead of syncing to the hottest |
-| `--mirror` | off | hotter card stays on its factory curve; cooler card mirrors it |
-| **`--temp-target CELSIUS`** | **off** | own all fans as one thermal zone around a target (50..91). Overrides `--mode`/`--mirror`. With a governor, sustained heat at 100% fan also derates power |
-| **`--power-budget WATTS`** | **off** | **enables the governor.** Total UPS load budget |
-| **`--power-ceiling WATTS`** | **off** | **also enables the governor, with no UPS required.** Per-GPU upper limit; `WATTS`, `W,W` per GPU, or `none`. Persisted |
-| `--power-ceiling-file PATH` | `/var/lib/nvidia-fan-control/power-ceiling` | ceiling state + live control file |
-| `--no-power-ceiling-file` | off | this run only; read and write nothing |
-| `--ups NAME` | `cyberpower` | NUT UPS name — `upsc -l` |
-| `--power-interval` | `5.0` | governor period; below ~2 s buys nothing |
-| `--power-fallback` | `300` | per-GPU clamp when the UPS is unreadable |
-| `--power-floor-on FLAG[,FLAG...]` | `OB,LB` | statuses that immediately use hardware floor |
-| `--power-dry-run` | off | log only, change nothing |
+| `--temp-emergency` | 92 | 2 s at or above it → every GPU to its hardware minimum |
+| `--power-budget` | 900 | total UPS load budget; omit it on hosts without a UPS |
+| `--ups` | `cyberpower` | NUT name |
+| `--power-floor-on` | `OB` | statuses that clamp every GPU to its floor |
+| `--power-fallback` | 150 | per-GPU limit if the UPS becomes unreadable |
+| `--power-interval` | 5 | seconds between UPS reads |
+| `--interval` | 2 | fan loop period |
 
-**The governor is off unless `--power-budget` or `--power-ceiling` is in play** (flag,
-or a ceiling persisted in the state file). Hosts with neither run exactly as before.
+**Seeding:** Ansible writes each settings file from inventory **only if it's absent**
+(`force: false`), so inventory is a first-boot default, never an override. The proposed seed
+for pve-ai is `adaptive`, mirror `on`, target `85`, ceiling `300` (the ceiling file already
+exists).
 
-**Hosts with no UPS can still use `--power-ceiling`** — the governor degenerates to
-holding the cap, and fan control is unaffected.
+## Unit requirements
 
-Reference invocation (dev box, pve-ai) — this is what actually runs there:
-
-```
---mirror --interval 2 --temp-target 90 --power-budget 900 --ups cyberpower \
-  --power-interval 5 --power-fallback 300 --power-floor-on OB
+```ini
+ExecStart=/usr/bin/python3 /opt/nvidia-fan-control/nvidia-fan-control.py \
+          --interval 2 --temp-emergency 92 --power-budget 900 --ups cyberpower \
+          --power-interval 5 --power-fallback 150 --power-floor-on OB
+ExecReload=/bin/kill -SIGHUP $MAINPID
+ExecStopPost=/usr/bin/python3 /opt/nvidia-fan-control/nvidia-fan-control.py --reset-fans
+StateDirectory=nvidia-fan-control     # /var/lib: saved settings + runtime-state.json
+RuntimeDirectory=nvidia-fan-control   # /run: overrides, lock, effective.json; removed on stop
+Restart=always
 ```
 
-`--power-ceiling` is deliberately absent: the state file is the source of truth so a live pin
-survives `systemctl restart`. See the power-ceiling section below.
+- **`ExecStopPost=… --reset-fans` is needed.** NVML does **not** revert manual fans when the
+  process dies: measured on pve-ai on 2026-09-29, the fans were still manual at 100% 150 s
+  after `kill -9`. A clean stop hands them back to the factory curve; a crash would leave them
+  wherever they were. `Restart=always` covers most of that window, and `ExecStopPost=` covers
+  the rest.
+- **`RuntimeDirectory=`** is what makes a restart clear hand-run overrides.
+- **Suggested description:** *"NVIDIA fan control + GPU power governor (UPS is a read-only
+  input)"*.
 
-## Per-host values that must NOT be copied blindly
-
-`--power-budget` is a function of **that host's UPS**, not a global. Derive it:
-
-```
-budget ≈ 0.85 × ups.realpower.nominal      # upsc <name> | grep realpower.nominal
-```
-
-On the dev box: nominal 1000 W → 900 W budget (chosen by the operator; 850 would be
-more conservative for an SLA unit). A host on a 3 kVA UPS should get a very different
-number, and a host with no UPS should not enable the governor at all.
+**Migration is safe in two steps.** The new script accepts the old unit's flags unchanged
+(`--mirror --interval 2 --temp-target 85 --power-budget 900 …`). `--temp-target` given without
+`--mode` means `adaptive`, so behaviour stays as it is today. The only differences: the thermal
+cut now triggers after 5 s instead of 15 s, and the emergency cutoff is armed. Then change the
+unit and seed the files. Until the unit drops those flags, a saved change to profile, mirror
+or target is acknowledged as *masked by a command-line flag*.
 
 ## Safety behaviour
 
 | Condition | Action |
 |---|---|
-| `ups.status` matches `--power-floor-on` | clamp all GPUs to the hardware floor (150 W on RTX PRO 6000); default `OB,LB` |
-| UPS unreadable 3× consecutively | clamp to `--power-fallback` rather than assume headroom |
-| Daemon exits / restarts, no ceiling | restores each GPU's **factory default** power limit and auto fan policy |
-| Daemon exits / restarts, ceiling set | **leaves GPUs pinned at the ceiling** (fan policy still returns to auto) |
-| Ceiling outside the hardware range | clamped into `[min, hw_max]` and logged; never an error |
-| Malformed ceiling control file | logged and **ignored**; the active cap is retained |
-| 100% fan and still ≥ `--temp-target` + 2 °C for a dwell | thermal governor derates the shared power cap (needs `--power-budget` or `--power-ceiling`) |
-| GPU ≥ 92 °C (`CRITICAL_TEMP`) | fan safety floor forces 100%, independent of the curve |
+| Card ≥ `--temp-emergency` for 2 s | Every GPU to its hardware minimum (150 W). Fans: 100% unless the profile is `native` with mirror off. Released at emergency − 30 °C for 30 s, then walks up +20 W / 30 s |
+| Card ≥ target + 2 °C for 5 s (adaptive: and fans ≥ its fan max) | Power cut in 20–150 W steps; released at target − 2 °C for 30 s, then walks up |
+| UPS status matches `--power-floor-on` | Every GPU to its hardware floor, immediately |
+| UPS unreadable 3× | Clamp to `--power-fallback` (never raising a card that's in a hold) |
+| Total UPS load > budget | Trim the shared cap by the measured excess; restore slowly |
+| Service stops cleanly | Fans → factory curve. Power: stays at the ceiling, or stays **lowered** if a hold is active (it never raises a hot card) |
+| Service crashes | Fans stay where they were unless `ExecStopPost=--reset-fans` runs (see above) |
+| Restart / reboot | Settings come back from the files. The learned adaptive trim is restored; thermal and emergency holds are restored if < 5 min old |
 
-## Power ceiling — operator contract
+## Operating it
 
-`--power-ceiling` replaces the card hardware max (600 W) as the value the governor
-restores toward, so power can be pinned at a chosen wattage while fan control and the
-UPS loop keep running. Added for benchmark repeatability: dynamic power made
-config-to-config comparisons noisy.
+`gpuguard` (`~/src/gpuguard`) is the operator CLI. Underneath it are the deploy team's verbs:
+`just gpu-ceiling-set <host> <value>` exists today; the fan-profile, mirror and target verbs
+follow the same contract. By hand:
 
 ```bash
-# pin / repin / unpin the RUNNING service — no restart, no bounce
-echo 300  | sudo tee /var/lib/nvidia-fan-control/power-ceiling
-echo none | sudo tee /var/lib/nvidia-fan-control/power-ceiling
-sudo systemctl reload nvidia-fan-control     # optional; SIGHUP re-reads immediately
-
-# what is pinned right now
-cat /var/lib/nvidia-fan-control/power-ceiling
-nvidia-smi --query-gpu=index,power.limit,power.max_limit --format=csv
+cat /run/nvidia-fan-control/effective.json          # what's in force, and why
+journalctl -u nvidia-fan-control -f | grep -E "^(FAN|TEMP|POWER|THERMAL|⚠)"
+python3 /opt/nvidia-fan-control/nvidia-fan-control.py --mode max   # temporary override while the service runs
+python3 /opt/nvidia-fan-control/nvidia-fan-control.py --clear-override
 ```
-
-Three things to know:
-
-1. **`ExecStart` deliberately does NOT pass `--power-ceiling`.** An explicit flag
-   overrides the state file at startup, so leaving it out makes the file the single
-   source of truth and lets a live pin survive `systemctl restart`. If you add the flag
-   to the unit, expect a restart to reset any live override to the declared value.
-   (`plans/decisions/001-power-ceiling-precedence.md`)
-2. **A ceiling outlives the daemon.** `systemctl stop` leaves the cards pinned — that is
-   the `nvidia-smi -pl` semantic the feature exists to provide. To hand the cards back
-   to stock you must unpin explicitly (`none`).
-3. **The cap is enforced against out-of-band writes.** Each governor tick re-reads the hardware
-   limit and re-applies the ceiling if something else raised it (a manual `nvidia-smi -pl`, another
-   script). Verified live on pve-ai. Lowering a ceiling is immediate; **raising** one waits for the
-   supervised restore path (idle dwell 60 s, or a headroom dwell), so do not expect an instant jump.
-4. **Reboot persistence is re-application, not hardware.** NVML power limits reset to
-   the card default on reboot; the daemon re-applies the persisted ceiling at service
-   start. There is a short window early in boot where the cards sit at 600 W. Nothing
-   is loaded then, but do not treat the ceiling as a firmware-level guarantee.
-
-With a budget also set, the ceiling changes nothing about the control law — the
-governor still throttles *below* it under UPS pressure and restores up to, never above,
-it. A ceiling at or under the UPS-safe wattage simply gives the loop no reason to
-throttle, which is the constant-power state benchmarks want. `--power-fallback` is
-bounded by the ceiling too.
 
 ## Gotchas
 
-- **Power limit ≠ power draw.** Idle cards draw ~16 W while their limit sits at 600 W,
-  even holding 166 GB of model weights. Do not read an idle wattage as evidence the
-  governor is or isn't needed.
-- **The sensor is coarse and slow.** This UPS exposes no `ups.realpower` — only
-  `ups.load` as an **integer percent** of nominal, refreshed every ~2 s. Watts are
-  derived at **10 W resolution**, and **sub-2 s transients are invisible**. This
-  governs sustained draw; it is *not* inrush protection.
-- **The learned cap belongs to its workload.** The governor keeps ONE common cap across cards and
-  trims it by the measured whole-system excess split across *active* cards only (idle neighbours no
-  longer dilute the correction). It does not chase low UPS samples upward mid-job: caps reset to MAX
-  only after every card has been idle (< 75 W board draw, < 5% utilization) for 60 s. Raising also
-  needs 3 consecutive under-budget samples and 30 s since the last change; down is 150 W/tick, up is
-  20 W/step.
-- **Fans are the first actuator, power is the second.** With `--temp-target`, power is only derated
-  after the fan has reached 100% and the card is still 2 °C over target for a dwell. Recovery is
-  slower than derating (30 s of being 2 °C *below* target), and while the thermal hold is engaged
-  UPS-driven recovery is suppressed so the two loops cannot fight.
-- **Reactive, not a permanent ceiling (changed 2026-08-20).** The governor leaves the
-  GPUs at their MAX limit while the UPS has headroom, and only throttles once total load
-  goes over budget — on the FIRST over-budget tick (grace=1). A truly brief spike still passes:
-  the ~2 s coarse UPS sensor can't see a sub-2 s transient, and the UPS rides a few seconds of
-  overshoot on surge/battery anyway (raise `POWER_OVER_GRACE_TICKS` to ride out longer ones). So there is **no throughput
-  cost at idle or moderate load** (an idle dry-run holds 600 W/GPU). Only under a sustained
-  overload does it trim toward `(budget − non_gpu)/n_gpus` — down fast (150 W/tick), back up
-  gently (40 W/tick). Grace and restore-margin are tunable (`POWER_OVER_GRACE_TICKS`,
-  `POWER_RESTORE_MARGIN_W`). The final recovery step snaps exactly to hardware max; the 15 W
-  deadband cannot strand a 600 W card at 590 W. The earlier proactive law pre-capped every GPU
-  even at idle.
-- **Live-load validated on pve-ai (2026-08-20).** Qwen3.8 on one GPU plus a bounded CPU probe
-  reached 1050 W while the UPS remained online. The normal reactive path cut both card limits
-  `590 → 440 → 290 → 150 W` across three 5-second ticks. Larger probes asserted `OL LB` while
-  the UPS still reported online; no `OB` transition was captured. Floor-trigger flags are now
-  configurable. pve-ai uses `--power-floor-on OB`, so `OL LB` remains in the ordinary 900 W
-  reactive budget loop while a real `OB` status still floors immediately.
-- **Throttle steps wait for fresh UPS feedback.** After reducing all GPU limits, the governor
-  holds them until either `ups.load` or `ups.status` changes. pve-ai's CyberPower cached 1030 W
-  for 36 seconds after CPU load stopped; acting repeatedly on that value drove limits to 150 W.
-  A 45-second timeout permits another step if the sensor is genuinely stuck during an overload.
-  Emergency floor flags bypass this gate. All GPUs still receive the same limit.
-- **Other devices on the same UPS are included in the budget.** This is intentional —
-  the thing being protected is the UPS. But it means unrelated load silently reduces
-  GPU headroom, which can look like an unexplained throttle.
-- **Fan control overrides the factory curve**, so a too-gentle custom curve can leave a
-  hot card under-cooled. The 92 °C `CRITICAL_TEMP` floor is the backstop; the GPU's own
-  thermal throttle (~88–90 °C) and shutdown (~95 °C) are the hardware ones. With
-  `--temp-target` the loop should hold the cards well below that, derating power if the
-  fans run out of authority.
+- **The UPS signal is coarse and lagging.** `ups.load` is an integer percent of nominal (10 W
+  on a 1000 W unit) and it refreshes on NUT's full-poll cycle (`pollfreq`, 5 s on pve-ai). The
+  budget handles sustained load, not a fast ramp. The **power ceiling** is what bounds a ramp.
+- **The budget usually binds before the ceiling does.** At a 600 W ceiling, one loaded card plus
+  CPU load hit 990 W and the governor throttled to 510 W. At a 300 W ceiling, two cards at full
+  load sat at ~870 W, which is close to the 900 W budget.
+- **Raising a limit is slow by design** (+20 W per 30 s, or the 60 s idle reset). Lowering is
+  immediate.
+- **The thermal cut is a shared cap**, so every card drops when the hottest card is over.
+- **`adaptive` needs a target.** Setting it without one is refused. Clearing the target while
+  it's active falls back to `native`.
+- **Per-GPU fan profiles aren't supported** (refused); the power ceiling is per GPU.
 
-## Suggested validation before enabling
+## Validation
 
-```bash
-# 1. sensor present and sane
-upsc <name> | grep -E 'ups.load|ups.status|realpower.nominal'
+With no GPU: `python3 tests/test_fan_policy.py && python3 tests/test_power_ceiling.py`.
 
-# 2. what would it do, right now, changing nothing
-python3 nvidia-fan-control.py --power-budget <W> --power-dry-run --once
-
-# 3. watch it converge under REAL load, still changing nothing
-python3 nvidia-fan-control.py --power-budget <W> --power-dry-run --power-interval 3
-```
-
-Only then put `--power-budget` in the unit.
+On hardware, the plan 002 run on pve-ai on 2026-09-29 covered: settings loaded from files;
+live switching; `native` really hands off (policy read back from NVML); target held by power
+alone under gpu-burn; `adaptive:50` capping the fans and then cutting power; the emergency
+cutoff with a live profile switch, release and walk; hand-run overrides and rollback; restart;
+and the crash test. The results are in `plans/002-layered-fan-policy.md`. For load, use
+`gpu-burn` in the `gpu-test` container (VMID 200) with `/root/ceiling-load-test.sh`.
 
 ## Files
 
-| File | |
+| File | What |
 |---|---|
-| `nvidia-fan-control.py` | the daemon (single file, stdlib + pynvml) |
-| `nvidia-fan-control.service` | **reference** unit — dev-box paths, adapt for the fleet |
-| *(load testing)* | `gpu-burn` (built for sm_120) in the `gpu-test` container, driven by `/root/ceiling-load-test.sh` on pve-ai; both are the deploy team's |
-| `README.md` | user-facing docs incl. control law and anti-oscillation values |
+| `nvidia-fan-control.py` | The daemon (a byte-copy of the golden file in `~/src/proxmox`) |
+| `nvidia-fan-control.service` | A reference unit; the canonical one is the Ansible template |
+| `tests/` | Fake-NVML test suites |
+| `plans/`, `plans/decisions/` | Design, decisions, lessons |

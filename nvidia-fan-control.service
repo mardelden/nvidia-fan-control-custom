@@ -1,37 +1,37 @@
 [Unit]
-Description=NVIDIA GPU fan control + UPS/thermal power governor — sync across cards (headless NVML)
+Description=NVIDIA fan control + GPU power governor (UPS is a read-only input)
 After=nvidia-persistenced.service nut-monitor.service
 Wants=nvidia-persistenced.service nut-monitor.service
 
 [Service]
 Type=simple
-# Reference invocation from pve-ai (2× RTX PRO 6000 on a CyberPower CP1500, nominal 1000 W).
-# Drop --power-budget/--ups/--power-fallback/--power-floor-on on hosts with no UPS; --temp-target
-# and --power-ceiling both work without one. Derive the budget as ~0.85-0.9 × ups.realpower.nominal.
-ExecStart=/usr/bin/python3 /opt/nvidia-fan-control/nvidia-fan-control.py --mirror --interval 2 --temp-target 90 --power-budget 900 --ups cyberpower --power-interval 5 --power-fallback 300 --power-floor-on OB
+# Reference unit. The canonical one on the fleet is the deploy team's Ansible template.
+#
+# ExecStart carries SAFETY LIMITS only. Operator settings (fan profile, mirror, temperature
+# target, power ceiling) live in files in the StateDirectory and are changed live. A flag
+# here would beat the file at every start and silently undo live changes. pve-ai values;
+# derive --power-budget as ~0.85-0.9 x ups.realpower.nominal, and drop the UPS flags on
+# hosts without a UPS.
+ExecStart=/usr/bin/python3 /opt/nvidia-fan-control/nvidia-fan-control.py --interval 2 --temp-emergency 92 --power-budget 900 --ups cyberpower --power-interval 5 --power-fallback 150 --power-floor-on OB
 ExecStop=/bin/kill -SIGTERM $MAINPID
-# `systemctl reload` re-reads the power-ceiling control file without bouncing fans.
+# Re-read the settings files at once (they are also polled every ~2 s).
 ExecReload=/bin/kill -SIGHUP $MAINPID
+# NVML does NOT revert manual fans when the process dies (measured 2026-09-29), so hand
+# every fan back to its factory curve after ANY exit, including a crash.
+ExecStopPost=/usr/bin/python3 /opt/nvidia-fan-control/nvidia-fan-control.py --reset-fans
 Restart=always
 RestartSec=5
 
-# Root is required for NVML fan control. On SIGTERM the daemon restores each card's
-# own factory fan curve; NVML also auto-reverts manual fan control if the process
-# stops refreshing, so a crash can't leave the fans stuck. Target mode ramps toward the
-# configured temperature; a hard safety floor still forces 100% at 92 C. Lightweight.
 User=root
 MemoryMax=128M
 
-# Creates /var/lib/nvidia-fan-control, which holds the power-ceiling state/control file.
-# NVML power limits reset to the card default on reboot, so the daemon re-applies the
-# persisted ceiling at startup from here. Pin/unpin a running service without a restart:
-#   echo 300  > /var/lib/nvidia-fan-control/power-ceiling
-#   echo none > /var/lib/nvidia-fan-control/power-ceiling
-# --power-ceiling is deliberately NOT in ExecStart: leaving it off makes that file the
-# single source of truth, so a live pin survives `systemctl restart`.
+# /var/lib/nvidia-fan-control: saved settings (fan-profile, fan-mirror, temp-target,
+#   power-ceiling) and runtime-state.json (learned trim, holds). Survives reboots.
 StateDirectory=nvidia-fan-control
+# /run/nvidia-fan-control: hand-run overrides, the lock, effective.json. Removed on stop,
+#   which is what makes a restart clear temporary overrides.
+RuntimeDirectory=nvidia-fan-control
 
-# Logging
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=nvidia-fan-control

@@ -1,23 +1,46 @@
 #!/usr/bin/env python3
 """
-Aggressive NVIDIA GPU Fan Control Daemon for Headless GPUs
-Designed for high-power AI workloads on RTX PRO 6000 cards
+NVIDIA fan control + GPU power governor for headless GPU hosts (RTX PRO 6000).
 
-Run as: sudo python3 nvidia-fan-control.py
-Or install as a systemd service
+GPU power governor. Keeps GPU power within the operator's limits (power ceiling,
+temperature target) and the host's safety limits (UPS budget, emergency temperature).
+It reads the UPS through NUT as a read-only input: it polls `upsc` every few seconds
+and never sends commands to the UPS or changes its settings. It does not shut the host
+down; that's NUT's `upsmon`. The only things it changes are GPU power limits and fan
+speeds.
+
+Settings (all live: picked up without a restart, and surviving reboots):
+
+    fan profile        native | quiet | aggressive | performance | max | adaptive[:FANMAX]
+    mirror             on | off         (both fans follow the hotter card; back-to-back cards)
+    temperature target degrees C | none
+    power ceiling      W | W,W | none   (per GPU)
+
+Each setting is resolved in this order: a command-line flag (hand-run only), then a
+temporary override in the run dir (/run/nvidia-fan-control, cleared on restart), then
+the saved file in the state dir (/var/lib/nvidia-fan-control), then the default.
+Safety limits (UPS budget, emergency temperature, floor flags, fallback) are
+command-line flags set by the deployment, never live settings.
+
+Run as root: `sudo python3 nvidia-fan-control.py`, or as the systemd service. The
+design is recorded in plans/002-layered-fan-policy.md.
 """
 
-import pynvml
+import argparse
+import errno
+import fcntl
+import json
+import logging
 import os
-import time
 import signal
 import subprocess
 import sys
-import argparse
-import logging
+import time
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-# Configure logging for systemd journal
+import pynvml
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(message)s',
@@ -25,87 +48,79 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Quiet idle, aggressive ramp curve (DEFAULT)
-# Matches NVIDIA default at idle, ramps hard above 45°C
+
+# ─────────────────────────── FAN PROFILES ───────────────────────────
+# (temperature C, fan %) points, linearly interpolated. `native` is not a table: it is
+# the card's own factory curve, which the daemon leaves alone. `adaptive` is not a table
+# either: it is the learning controller below.
+
+# Quiet at idle, but ramps hard: full blast by 65 C.
 QUIET_CURVE = [
-    (40, 30),   # ≤40°C -> 30% (match NVIDIA default idle)
-    (45, 40),   # 45°C -> 40% (gentle start)
-    (50, 55),   # 50°C -> 55% (starting to work)
-    (55, 75),   # 55°C -> 75% (ramping hard)
-    (60, 90),   # 60°C -> 90% (aggressive)
-    (65, 100),  # 65°C -> 100% (full blast)
+    (40, 30),
+    (45, 40),
+    (50, 55),
+    (55, 75),
+    (60, 90),
+    (65, 100),
 ]
 
-# Aggressive fan curve: (temp_threshold, fan_speed_percent)
-# Fans ramp up much earlier and faster than default
 AGGRESSIVE_FAN_CURVE = [
-    (30, 40),   # 30°C -> 40% (never let fans be quiet)
-    (40, 50),   # 40°C -> 50%
-    (50, 65),   # 50°C -> 65%
-    (55, 75),   # 55°C -> 75%
-    (60, 85),   # 60°C -> 85%
-    (65, 95),   # 65°C -> 95%
-    (70, 100),  # 70°C -> 100% (full blast)
+    (30, 40),
+    (40, 50),
+    (50, 65),
+    (55, 75),
+    (60, 85),
+    (65, 95),
+    (70, 100),
 ]
 
-# Even more aggressive "performance" curve
 PERFORMANCE_FAN_CURVE = [
-    (25, 50),   # 25°C -> 50% (always loud, always cool)
-    (35, 60),   # 35°C -> 60%
-    (45, 75),   # 45°C -> 75%
-    (50, 85),   # 50°C -> 85%
-    (55, 95),   # 55°C -> 95%
-    (60, 100),  # 60°C -> 100%
+    (25, 50),
+    (35, 60),
+    (45, 75),
+    (50, 85),
+    (55, 95),
+    (60, 100),
 ]
 
-# Maximum cooling - just run at 100% always
 MAX_COOLING_CURVE = [
-    (0, 100),   # Always 100%
+    (0, 100),
 ]
 
-# STOCK-matched curve — approximates the card's OWN factory fan curve (measured on
-# RTX PRO 6000: ~30% idle, ~44% @76°C, ~54% @88°C). Paired with sync it keeps the
-# native quiet behaviour but ties both cards together, so the ONLY change vs stock is
-# the cooler card's fan rising to match the hotter one — isolates the airflow/sync gain.
-NATIVE_CURVE = [
-    (40, 30),   # idle — matches stock
-    (60, 35),
-    (70, 41),
-    (78, 46),
-    (85, 52),
-    (90, 58),
-]
+CURVES = {
+    "quiet": QUIET_CURVE,
+    "aggressive": AGGRESSIVE_FAN_CURVE,
+    "performance": PERFORMANCE_FAN_CURVE,
+    "max": MAX_COOLING_CURVE,
+}
+PROFILE_NAMES = ("native", "quiet", "aggressive", "performance", "max", "adaptive")
+DEFAULT_PROFILE = "native"
 
-# HARD SAFETY FLOOR — regardless of the selected curve, force 100% fan at/above this
-# temperature. Because this daemon OVERRIDES the card's own fan curve, a too-gentle
-# custom curve (e.g. 'native' tops at 58%) could otherwise leave fans low while a card
-# is dangerously hot. The GPU's own thermal throttle (~88-90°C, clocks drop) and
-# emergency shutdown (~95°C+) are the hardware backstop above this.
-CRITICAL_TEMP = 92
-
-# Optional temperature-target mode. Unlike --mirror (which hands the hot card back
-# and forth between factory auto and our emergency override), this owns both
-# cards' fans continuously and treats them as one thermal zone. Demand rises along a
-# target-relative approach band, rises quickly, and falls slowly to avoid fan hunting.
+# ── adaptive: the learning controller ──
+# A feed-forward ramp from TARGET_FAN_MIN_PCT at (target - APPROACH_BAND) to 100% at the
+# target, plus a learned trim that finds the quietest fan speed holding the card AT the
+# target. The trim learns downward slowly within TRACKING_BAND below the target, holds at
+# the target, and unwinds fast above it. It only ever makes the fans quieter than the ramp.
 TARGET_FAN_MIN_PCT = 30
 TARGET_FAN_APPROACH_BAND_C = 20
 TARGET_FAN_SLEW_UP_PCT = 10
 TARGET_FAN_SLEW_DOWN_PCT = 2
-
-# The linear target-relative curve is a safe feed-forward starting point, not the
-# final command. An integral trim learns how much less fan this particular chassis
-# needs to sit AT the requested temperature. Learn downward slowly while below the
-# target, freeze at the setpoint, and unwind quickly if temperature rises above it.
 TARGET_TRACKING_BAND_C = 8
 TARGET_TRIM_MIN_PCT = -50.0
 TARGET_TRIM_DOWN_PCT_PER_C_S = 0.125
 TARGET_TRIM_UP_PCT_PER_C_S = 2.5
+ADAPTIVE_FAN_MAX_MIN_PCT = TARGET_FAN_MIN_PCT   # a fan max below the floor is contradictory
+DEFAULT_ADAPTIVE_FAN_MAX_PCT = 100
 
-# If maximum fans cannot hold the target, cooling has run out of actuator authority.
-# Derate the existing common power ceiling instead of letting temperature oscillate
-# at the emergency boundary. Recovery is deliberately slower than derating.
+TEMP_TARGET_MIN_C = 50
+
+
+# ─────────────────────────── THERMAL POWER ───────────────────────────
+# The temperature target is held by cutting GPU power once the card is at target +
+# MARGIN for a dwell. A 2 C overshoot for up to 5 s is accepted by design. With the fixed
+# curves the fan speed is irrelevant; with adaptive the fans must also be at its fan max.
 THERMAL_POWER_MARGIN_C = 2
-THERMAL_POWER_INITIAL_DWELL_S = 15.0
+THERMAL_POWER_INITIAL_DWELL_S = 5.0
 THERMAL_POWER_REPEAT_DWELL_S = 5.0
 THERMAL_POWER_MIN_STEP_W = 20.0
 THERMAL_POWER_MAX_STEP_W = 150.0
@@ -113,73 +128,171 @@ THERMAL_POWER_W_PER_EXCESS_C = 10.0
 THERMAL_POWER_RECOVER_MARGIN_C = 2
 THERMAL_POWER_RECOVER_DWELL_S = 30.0
 
+# ── emergency cutoff: always armed, for every profile ──
+# At the emergency temperature for EMERGENCY_DWELL_S, every GPU drops to its hardware
+# minimum power. Released once the card is EMERGENCY_RELEASE_DROP_C below the emergency
+# temperature for EMERGENCY_RELEASE_DWELL_S; power then walks back up in steps.
+DEFAULT_TEMP_EMERGENCY_C = 92
+TEMP_EMERGENCY_MIN_C = 60
+TEMP_EMERGENCY_MAX_C = 95
+EMERGENCY_DWELL_S = 2.0
+EMERGENCY_RELEASE_DROP_C = 30
+EMERGENCY_RELEASE_DWELL_S = 30.0
 
-# ─────────────────────────── POWER GOVERNOR ───────────────────────────
-# Closed-loop whole-server power cap. The UPS is the sensor (it is the only thing
-# that sees TOTAL draw, including CPU/board/disks) and the GPU power limit is the
-# actuator. Goal: keep total UPS load under budget so the UPS can actually carry
-# the machine, instead of tripping on overload.
+
+# ─────────────────────────── UPS BUDGET ───────────────────────────
+# The UPS is the only sensor that sees TOTAL draw (CPU, board, disks), and the GPU power
+# limit is the actuator. Goal: keep total UPS load under budget so the UPS can actually
+# carry the machine.
 #
 # Measured baseline on pve-ai (CyberPower CP1500PFCLCDa, ups.realpower.nominal=1000):
 #   idle total ~220 W with GPUs at ~16 W each  ->  non-GPU floor ~190 W
 #   Threadripper 7970X peaks ~355 W, so non-GPU can reach ~480 W under CPU load.
-# With a 900 W budget that leaves 420-710 W to split across the GPUs.
-
-# UPS load is reported as INTEGER PERCENT of ups.realpower.nominal, so resolution
-# is nominal/100 (10 W on a 1000 W unit). Do not expect finer control than that.
-DEFAULT_POWER_BUDGET = 900          # watts, total UPS load ceiling
+#
+# UPS load is reported as INTEGER PERCENT of ups.realpower.nominal, so resolution is
+# nominal/100 (10 W on a 1000 W unit). Do not expect finer control than that.
+DEFAULT_POWER_BUDGET = 900          # watts, total UPS load
 DEFAULT_UPS_NAME = "cyberpower"     # `upsc -l` name
 DEFAULT_POWER_INTERVAL = 5.0        # seconds between governor updates
 
-# Anti-oscillation. The UPS driver polls every ~2 s and NVML's own enforcement has
-# its own time constant, so a naive proportional loop will hunt. Downward changes
-# shed the measured whole-system excess (bounded for safety); upward changes require
-# sustained headroom and are deliberately small.
-POWER_DEADBAND_W = 15               # ignore changes smaller than this
-POWER_SLEW_DOWN_W = 150             # max decrease per update (react fast)
-POWER_SLEW_UP_W = 20                # max increase after a sustained-headroom dwell
+# Anti-oscillation. The UPS driver refreshes on its own cycle and NVML enforcement has
+# its own time constant, so a naive proportional loop hunts. Downward changes shed the
+# measured whole-system excess (bounded); upward changes need sustained headroom and are
+# deliberately small.
+POWER_DEADBAND_W = 15
+POWER_SLEW_DOWN_W = 150
+POWER_SLEW_UP_W = 20
+POWER_OVER_GRACE_TICKS = 1
+POWER_RESTORE_MARGIN_W = 50
+POWER_RESTORE_HEADROOM_TICKS = 3
+POWER_RESTORE_DWELL_S = 30.0
+POWER_IDLE_DRAW_W = 75.0
+POWER_IDLE_UTIL_PCT = 5
+POWER_IDLE_DWELL_S = 60.0
 
-# Reactive law: leave GPUs at MAX while the UPS has headroom; throttle once load goes over
-# budget. Default reacts on the FIRST over-budget tick (grace=1, the minimum). A truly brief
-# spike still passes: the UPS sensor is ~2 s coarse so a sub-2 s transient never registers, and
-# the down-slew is bounded (150 W/tick), so the first throttle step is gentle regardless. Raise
-# POWER_OVER_GRACE_TICKS to also ride out LONGER sustained overshoots before reacting.
-POWER_OVER_GRACE_TICKS = 1          # throttle on the first over-budget tick (min; sub-2s spikes pass via sensor coarseness)
-POWER_RESTORE_MARGIN_W = 50         # only restore toward MAX when this far under budget (hysteresis)
-POWER_RESTORE_HEADROOM_TICKS = 3    # require repeated under-budget observations before raising a learned cap
-POWER_RESTORE_DWELL_S = 30.0        # minimum time between upward cap changes
-POWER_IDLE_DRAW_W = 75.0            # per-GPU board-power ceiling for considering a card idle
-POWER_IDLE_UTIL_PCT = 5             # utilization ceiling for considering a card idle
-POWER_IDLE_DWELL_S = 60.0           # all cards must stay idle this long before resetting caps to MAX
-
-# Fail-safe: if the UPS can't be read this many times in a row we are flying blind,
-# so clamp to a conservative per-GPU limit rather than assuming headroom.
+# Fail-safe: if the UPS can't be read this many times in a row we are flying blind, so
+# clamp to a conservative per-GPU limit rather than assume headroom.
 POWER_MAX_READ_FAILURES = 3
-DEFAULT_POWER_FALLBACK_W = 300      # per-GPU limit when the sensor is unavailable
+DEFAULT_POWER_FALLBACK_W = 300
 
-# After a downward limit step, do not act again on the same cached UPS sample.
-# pve-ai's CyberPower held a stale 1030 W value for 36 s after load disappeared;
-# without this gate, falling GPU draw was misattributed as rising non-GPU load.
+# After a downward step, do not act again on the same cached UPS sample. pve-ai's
+# CyberPower held a stale 1030 W value for 36 s after load disappeared; without this gate,
+# falling GPU draw was misattributed as rising non-GPU load.
 POWER_FEEDBACK_TIMEOUT_S = 45.0
 
-# NUT ups.status flags that immediately clamp GPUs to their hardware floor.
-# Conservative default preserves the original behavior; hosts can configure only
-# OB when LB merely reflects low estimated runtime while the UPS remains OL.
+# NUT ups.status flags that immediately clamp every GPU to its hardware floor.
 DEFAULT_POWER_FLOOR_FLAGS = ("OB", "LB")
 
-# ── POWER CEILING ──
-# Operator-set upper actuation bound. Replaces the card's hardware max as the value
-# the governor restores toward, so power can be pinned at a chosen wattage (e.g. for
-# apples-to-apples benchmarking) WITHOUT stopping the daemon and losing fan control,
-# thermal derating and the UPS safety loop. Works with or without a UPS: with a budget
-# the governor still throttles BELOW the ceiling under UPS or thermal pressure and
-# restores up to (never above) it; with no budget it simply holds the cap.
-#
-# NVML power limits do not survive a reboot, so persistence is re-application at
-# startup from this file. The same file doubles as the live control file: it is polled
-# every update() and SIGHUP forces an immediate re-read, so a benchmark can pin/unpin
-# without restarting the service.
-DEFAULT_POWER_CEILING_FILE = "/var/lib/nvidia-fan-control/power-ceiling"
+
+# ─────────────────────────── FILES ───────────────────────────
+DEFAULT_STATE_DIR = "/var/lib/nvidia-fan-control"   # saved settings + runtime state
+DEFAULT_RUN_DIR = "/run/nvidia-fan-control"         # overrides, lock, effective state
+SETTING_FILES = {
+    "profile": "fan-profile",
+    "mirror": "fan-mirror",
+    "target": "temp-target",
+    "ceiling": "power-ceiling",
+}
+SETTING_NAMES = ("profile", "mirror", "target", "ceiling")
+LOG_PREFIX = {"profile": "FAN", "mirror": "FAN", "target": "TEMP", "ceiling": "POWER"}
+RUNTIME_STATE_FILE = "runtime-state.json"
+EFFECTIVE_FILE = "effective.json"
+LOCK_FILE = "daemon.lock"
+RUNTIME_SAVE_INTERVAL_S = 60.0
+HOLD_RESTORE_MAX_AGE_S = 300.0
+OVERRIDE_ACK_TIMEOUT_S = 15.0
+
+
+# ─────────────────────────── PARSERS ───────────────────────────
+
+@dataclass(frozen=True)
+class FanProfile:
+    name: str
+    fan_max: int = DEFAULT_ADAPTIVE_FAN_MAX_PCT
+
+    def text(self) -> str:
+        if self.name == "adaptive" and self.fan_max != DEFAULT_ADAPTIVE_FAN_MAX_PCT:
+            return f"adaptive:{self.fan_max}"
+        return self.name
+
+    def describe(self) -> str:
+        if self.name == "adaptive":
+            return f"adaptive, fan max {self.fan_max}%"
+        return self.name
+
+
+def _strip(text: str) -> str:
+    return text.split("#", 1)[0].strip().lower()
+
+
+def parse_fan_profile(value: str) -> FanProfile:
+    """`native` | `quiet` | `aggressive` | `performance` | `max` | `adaptive[:FANMAX]`."""
+    text = _strip(value)
+    if text == "":
+        return FanProfile(DEFAULT_PROFILE)
+    if "," in text:
+        raise ValueError("per-GPU fan profiles are not supported; use one profile per host")
+    name, _, arg = text.partition(":")
+    if name not in PROFILE_NAMES:
+        raise ValueError(f"unknown profile {name!r}; expected one of {', '.join(PROFILE_NAMES)}")
+    if name != "adaptive":
+        if arg:
+            raise ValueError(f"profile {name!r} takes no parameter")
+        return FanProfile(name)
+    if not arg:
+        return FanProfile("adaptive")
+    try:
+        fan_max = int(arg.rstrip("%"))
+    except ValueError:
+        raise ValueError(f"adaptive fan max must be a percentage, got {arg!r}")
+    if not ADAPTIVE_FAN_MAX_MIN_PCT <= fan_max <= 100:
+        raise ValueError(f"adaptive fan max must be {ADAPTIVE_FAN_MAX_MIN_PCT}..100, got {fan_max}")
+    return FanProfile("adaptive", fan_max)
+
+
+def parse_mirror(value: str) -> bool:
+    text = _strip(value)
+    if text in ("", "off", "false", "no", "0"):
+        return False
+    if text in ("on", "true", "yes", "1"):
+        return True
+    raise ValueError(f"expected on or off, got {text!r}")
+
+
+def parse_temp_target(value: str) -> Optional[int]:
+    """Degrees C, or `none` / `off` / empty for no target. The upper bound depends on the
+    emergency temperature and is checked by the controller."""
+    text = _strip(value)
+    if text in ("", "none", "off"):
+        return None
+    try:
+        celsius = int(text.rstrip("c"))
+    except ValueError:
+        raise ValueError(f"expected degrees C or none, got {text!r}")
+    if celsius < TEMP_TARGET_MIN_C:
+        raise ValueError(f"target must be at least {TEMP_TARGET_MIN_C}C, got {celsius}C")
+    return celsius
+
+
+def parse_power_ceiling(value: str) -> List[float]:
+    """`WATTS`, `WATTS,WATTS,...` (per GPU), or `none` to unpin.
+
+    Returns [] for an explicit unpin, so callers can tell it apart from "not given".
+    """
+    text = _strip(value)
+    if text in ("", "none", "off", "0"):
+        return []
+    out: List[float] = []
+    for part in text.split(","):
+        part = part.strip()
+        try:
+            watts = float(part)
+        except ValueError:
+            raise ValueError(f"expected watts or a comma-separated per-GPU list, got {part!r}")
+        if watts <= 0:
+            raise ValueError(f"power ceiling must be > 0 W, got {watts:g}")
+        out.append(watts)
+    return out
 
 
 def parse_power_floor_flags(value: str) -> Tuple[str, ...]:
@@ -195,73 +308,162 @@ def parse_power_floor_flags(value: str) -> Tuple[str, ...]:
     return flags
 
 
-def parse_power_ceiling(value: str) -> List[float]:
-    """Parse a power ceiling: `WATTS`, `WATTS,WATTS,...` (per-GPU), or `none` to unpin.
+def _parse_setting(name: str, text: str):
+    """Parse a setting's file text into its value. Raises ValueError."""
+    if name == "profile":
+        return parse_fan_profile(text)
+    if name == "mirror":
+        return parse_mirror(text)
+    if name == "target":
+        return parse_temp_target(text)
+    request = parse_power_ceiling(text)
+    return request or None
 
-    Returns [] for an explicit unpin, so callers can tell "operator asked for no
-    ceiling" apart from "flag absent" (argparse default None).
-    """
-    text = value.strip().lower()
-    if text in ("", "none", "off", "0"):
-        return []
-    out: List[float] = []
-    for part in text.split(","):
-        part = part.strip()
+
+def format_setting(name: str, value) -> str:
+    if name == "profile":
+        return value.text()
+    if name == "mirror":
+        return "on" if value else "off"
+    if name == "target":
+        return "none" if value is None else str(value)
+    return "none" if not value else ",".join(f"{w:g}" for w in value)
+
+
+SETTING_DEFAULTS = {"profile": FanProfile(DEFAULT_PROFILE), "mirror": False,
+                    "target": None, "ceiling": None}
+
+
+def _argtype(parser_fn):
+    def wrap(value):
         try:
-            watts = float(part)
-        except ValueError:
-            raise argparse.ArgumentTypeError(
-                f"expected watts or a comma-separated per-GPU list, got {part!r}")
-        if watts <= 0:
-            raise argparse.ArgumentTypeError(f"power ceiling must be > 0 W, got {watts:g}")
-        out.append(watts)
-    return out
+            return parser_fn(value)
+        except ValueError as e:
+            raise argparse.ArgumentTypeError(str(e))
+    return wrap
 
 
-def read_ceiling_file(path: str) -> Tuple[bool, Optional[List[float]]]:
-    """Read the ceiling control/state file.
+def _write_atomic(path: str, text: str):
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
 
-    Returns (ok, request). ok=False means "no usable value — keep whatever ceiling is
-    already active": a missing file, an unreadable one, or garbage. A benchmark script
-    typo must never silently un-pin the cards. ok=True with request=None is an
-    explicit unpin; ok=True with a list is a ceiling in watts.
+
+# ─────────────────────────── SETTINGS ───────────────────────────
+
+class SettingsStore:
+    """Resolves the four live settings from their layers, and notices changes.
+
+    Precedence: `cli` (hand-run flags, in memory) > override (run dir) > saved (state dir)
+    > default. Files are polled by stat() on every call (cheap), and SIGHUP forces a full
+    re-read. A malformed file is logged and ignored: that layer keeps its previous value, so
+    a typo can never silently change what is in force.
     """
-    try:
-        with open(path) as f:
-            raw = f.read()
-    except FileNotFoundError:
-        return (False, None)
-    except OSError as e:
-        log.warning(f"⚠ POWER: cannot read ceiling file {path}: {e}")
-        return (False, None)
-    raw = raw.split("#", 1)[0].strip()   # allow operators to annotate the file
-    try:
-        request = parse_power_ceiling(raw)
-    except argparse.ArgumentTypeError as e:
-        log.error(f"POWER: ignoring malformed ceiling file {path}: {e}")
-        return (False, None)
-    return (True, request or None)
+
+    def __init__(self, state_dir: str, run_dir: str, cli: Optional[Dict[str, object]] = None):
+        self.dirs = {"saved": state_dir, "override": run_dir}
+        self.cli = dict(cli or {})
+        self.layers: Dict[str, Dict[str, object]] = {"saved": {}, "override": {}}
+        self.stamps: Dict[str, Dict[str, Optional[Tuple[int, int]]]] = {"saved": {}, "override": {}}
+        self.effective: Dict[str, Tuple[object, str]] = {}
+        self._reload = True
+        self.generation = 0
+
+    def path(self, layer: str, name: str) -> str:
+        return os.path.join(self.dirs[layer], SETTING_FILES[name])
+
+    def request_reload(self):
+        self._reload = True
+
+    def _stamp(self, path: str) -> Optional[Tuple[int, int]]:
+        try:
+            st = os.stat(path)
+            return (st.st_mtime_ns, st.st_size)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return ("error", 0)   # unreadable dir etc.: treat as a change and retry later
+
+    def _read_layer(self, layer: str, name: str, force: bool) -> bool:
+        path = self.path(layer, name)
+        stamp = self._stamp(path)
+        if not force and name in self.stamps[layer] and self.stamps[layer][name] == stamp:
+            return False
+        self.stamps[layer][name] = stamp
+        had = name in self.layers[layer]
+        if stamp is None:
+            self.layers[layer].pop(name, None)
+            return had
+        try:
+            with open(path) as f:
+                text = f.read()
+        except OSError as e:
+            log.warning(f"⚠ {LOG_PREFIX[name]}: cannot read {path}: {e}")
+            return False
+        try:
+            value = _parse_setting(name, text)
+        except ValueError as e:
+            what = "ceiling file" if name == "ceiling" else f"{SETTING_FILES[name]} file"
+            log.error(f"{LOG_PREFIX[name]}: ignoring malformed {what} {path}: {e}")
+            return False
+        old = self.layers[layer].get(name, None)
+        self.layers[layer][name] = value
+        return (not had) or old != value
+
+    def resolve(self, name: str) -> Tuple[object, str]:
+        if name in self.cli:
+            return self.cli[name], "flag"
+        if name in self.layers["override"]:
+            return self.layers["override"][name], "override"
+        if name in self.layers["saved"]:
+            return self.layers["saved"][name], "saved"
+        return SETTING_DEFAULTS[name], "default"
+
+    def refresh(self) -> Tuple[List[Tuple[str, object, str]], List[Tuple[str, object, str]]]:
+        """Re-read what changed. Returns (effective changes, masked saved changes).
+
+        A masked change is a saved file that changed while a higher layer hides it. It is
+        reported so the deploy team's verbs still see an acknowledgement in the journal.
+        """
+        force = self._reload
+        self._reload = False
+        masked = []
+        for name in SETTING_NAMES:
+            self._read_layer("override", name, force)
+            if self._read_layer("saved", name, force):
+                value, source = self.resolve(name)
+                if source in ("flag", "override") and name in self.layers["saved"]:
+                    masked.append((name, self.layers["saved"][name], source))
+        changes = []
+        for name in SETTING_NAMES:
+            value, source = self.resolve(name)
+            if self.effective.get(name) != (value, source):
+                prev = self.effective.get(name)
+                self.effective[name] = (value, source)
+                if prev is None or prev[0] != value:
+                    changes.append((name, value, source))
+        if force:
+            self.generation += 1
+        return changes, masked
 
 
-def parse_temp_target(value: str) -> int:
-    """Parse a useful GPU temperature target below the hard safety boundary."""
-    try:
-        target = int(value)
-    except ValueError as e:
-        raise argparse.ArgumentTypeError("temperature target must be an integer") from e
-    if not 50 <= target < CRITICAL_TEMP:
-        raise argparse.ArgumentTypeError(
-            f"temperature target must be 50..{CRITICAL_TEMP - 1} C")
-    return target
+def describe_source(store: "SettingsStore", name: str, source: str) -> str:
+    if source == "flag":
+        return "command-line flag"
+    if source == "default":
+        return "default"
+    return f"{'temporary override' if source == 'override' else 'saved'} {store.path(source, name)}"
 
+
+# ─────────────────────────── UPS ───────────────────────────
 
 class UpsReader:
-    """Reads total system draw from NUT (`upsc <name>`).
+    """Reads total system draw from NUT (`upsc <name>`), read-only.
 
-    This UPS (CyberPower CP1500PFCLCDa) does NOT expose `ups.realpower`, only
-    `ups.load` as an integer percent of `ups.realpower.nominal` — so watts are
-    derived, with nominal/100 resolution. The raw `ups.status` tokens are returned
-    to the governor, which decides which configured flags require an immediate floor.
+    This UPS (CyberPower CP1500PFCLCDa) does NOT expose `ups.realpower`, only `ups.load`
+    as an integer percent of `ups.realpower.nominal`, so watts are derived with nominal/100
+    resolution. The raw `ups.status` tokens are returned to the governor.
     """
 
     def __init__(self, ups_name: str = DEFAULT_UPS_NAME):
@@ -302,38 +504,28 @@ class UpsReader:
             return None
 
 
+# ─────────────────────────── POWER GOVERNOR ───────────────────────────
+
 class PowerGovernor:
-    """Keeps TOTAL UPS load under `budget` by capping GPU power limits — REACTIVELY.
+    """The GPU power governor: the only thing that writes GPU power limits.
 
-    An operator-set POWER CEILING (see the ceiling machinery below) replaces the
-    hardware max as the upper actuation bound, so "MAX" below means the ceiling whenever
-    one is set. The control law is otherwise unchanged: UPS and thermal pressure still
-    throttle BELOW the ceiling, and recovery restores up to — never above — it. With
-    budget_w=None there is no UPS at all and the governor degenerates to holding the
-    ceiling, while thermal derating keeps working.
+    Limits it enforces, from the operator and from the host:
 
-    New workloads start at MAX. The ceiling is pulled down as soon as load goes over
-    budget (on the FIRST over-budget tick by default), then retained as a learned cap
-    while work remains active. A truly brief spike still passes: the ~2 s coarse UPS
-    sensor cannot see it and the down-slew is bounded.
+    - **Power ceiling** (operator, per GPU): the upper actuation bound. It's applied by
+      SHRINKING max_w, never by clamping at the decision sites. _set_limit() and every
+      control path already bound writes to max_w, so one assignment caps the whole
+      actuator surface. Any code that sets a power limit MUST go through _set_limit().
+    - **Temperature target** (operator): observe_thermal() cuts power at target + 2 C
+      for 5 s, stepping by the excess, and releases at target - 2 C for 30 s.
+    - **Emergency temperature** (host safety): observe_emergency() drops every GPU to its
+      hardware minimum after 2 s at the emergency temperature. Always armed.
+    - **UPS budget** (host safety, optional): update() keeps TOTAL UPS load under budget
+      by trimming a learned common cap by the measured excess, reacting on the first
+      over-budget tick, and restoring slowly with sustained headroom. With budget_w=None
+      there is no UPS at all and the governor holds the ceiling.
 
-    Control law each tick:
-        over budget for >= GRACE ticks  -> common_cap -= measured UPS excess
-        near budget                     -> hold the learned common cap
-        sustained headroom              -> common_cap += a small restore step
-        all GPUs idle for a dwell        -> reset every cap directly to hardware MAX
-
-    The excess-based adjustment matters when only one of several GPUs is active. The
-    common-cap reduction is `UPS excess / active GPU count`; idle cards retain the same
-    ceiling but do not dilute the corrective step. Remembering the resulting safe ceiling
-    also prevents the old 600 -> 450 -> 600 limit wave.
-
-    (Earlier revisions used a PROACTIVE law — per_gpu = (budget-non_gpu)/n EVERY tick —
-    which pre-capped the GPUs even at idle. Changed to reactive per operator 2026-08-20:
-    brief overshoots are acceptable, only sustained ones warrant a throttle.)
-
-    `non_gpu` remains a diagnostic derived from the UPS and aggregate board draw; the
-    control error itself comes directly from whole-system UPS watts.
+    After a thermal or emergency hold is released, power walks back up in POWER_SLEW_UP_W
+    steps every POWER_RESTORE_DWELL_S, never as a jump.
     """
 
     def __init__(self, handles: List, budget_w: Optional[float] = None,
@@ -341,14 +533,8 @@ class PowerGovernor:
                  interval: float = DEFAULT_POWER_INTERVAL,
                  fallback_w: float = DEFAULT_POWER_FALLBACK_W,
                  floor_on_flags: Tuple[str, ...] = DEFAULT_POWER_FLOOR_FLAGS,
-                 dry_run: bool = False,
-                 ceiling_request: Optional[List[float]] = None,
-                 ceiling_path: Optional[str] = None,
-                 persist_startup_ceiling: bool = False,
-                 ceiling_source: str = "startup"):
+                 dry_run: bool = False):
         self.handles = handles
-        # None => no UPS sensor available; ceiling-only ("hold") mode. Thermal derating
-        # still runs, since it uses fan% and temperature rather than the UPS.
         self.budget_w = budget_w
         self.interval = interval
         self.fallback_w = fallback_w
@@ -373,23 +559,23 @@ class PowerGovernor:
         self._idle_since: Optional[float] = None
         self.learned_cap_w: Optional[float] = None
         self._last_ups_reading: Optional[Tuple[float, Tuple[str, ...]]] = None
+        # thermal hold (temperature target)
         self._thermal_hot_since: Optional[float] = None
         self._thermal_cool_since: Optional[float] = None
         self._last_thermal_step = 0.0
-        self._thermal_limited = False
-        # Ceiling. ceiling_request is what was ASKED for (one value = broadcast to all
-        # GPUs, or one per GPU); ceiling_w is the per-GPU value actually in force after
-        # clamping into the hardware range. Both None when unpinned.
-        self.ceiling_request: Optional[List[float]] = ceiling_request or None
+        self.thermal_limited = False
+        # emergency cutoff
+        self.emergency_active = False
+        self._emergency_hot_since: Optional[float] = None
+        self._emergency_cool_since: Optional[float] = None
+        # after a hold is released, raise power in steps rather than jumping
+        self.recovery_walk = False
+        self.ceiling_request: Optional[List[float]] = None
         self.ceiling_w: Optional[List[float]] = None
-        self.ceiling_path = ceiling_path
-        self.ceiling_source = ceiling_source
-        self.persist_startup_ceiling = persist_startup_ceiling
-        self._ceiling_stamp: Optional[Tuple[int, int]] = None
-        self._reload_requested = False
         self._hold_log_pending = True
 
-    def init(self):
+    # ── setup ──
+    def init(self, ceiling_request: Optional[List[float]] = None, source: str = "startup"):
         for i, h in enumerate(self.handles):
             lo, hi = pynvml.nvmlDeviceGetPowerManagementLimitConstraints(h)
             self.min_w.append(lo / 1000.0)
@@ -404,47 +590,32 @@ class PowerGovernor:
 
         dry = "  [DRY RUN — nothing will be set]" if self.dry_run else ""
         if self.budget_w is None:
-            log.info("Power budget: DISABLED (no UPS sensor) — ceiling-only mode" + dry)
+            log.info("Power budget: none (no UPS sensor)" + dry)
         else:
-            log.info(f"Power budget: {self.budget_w:.0f} W total UPS load" + dry)
+            log.info(f"Power budget: {self.budget_w:.0f} W total UPS load (read-only input)" + dry)
             log.info("Immediate power-floor UPS flags: " + ",".join(self.floor_on_flags))
 
         # Applied BEFORE learned_cap_w is seeded, so the learned common cap starts at the
-        # ceiling rather than at the pre-ceiling hardware limit. This is also what makes a
-        # ceiling survive a reboot: NVML limits reset to the card default at boot, so the
-        # daemon re-applies the persisted request here.
-        if self.ceiling_request is not None:
-            self._apply_ceiling(self.ceiling_request, self.ceiling_source)
+        # ceiling rather than at the pre-ceiling hardware limit. NVML limits reset to the
+        # card default at boot, so this is also how a ceiling survives a reboot.
+        if ceiling_request is not None:
+            self.apply_ceiling(ceiling_request, source)
         else:
             log.info("Power ceiling: none — upper limit is the card hardware max "
                      + "/".join(f"{w:.0f}" for w in self.hw_max_w) + " W")
             if self.budget_w is None:
-                self._release_to_default(self.ceiling_source)
-        if self.persist_startup_ceiling:
-            self._write_ceiling_file()
-        self._ceiling_stamp = self._ceiling_file_stamp()
-        if self.ceiling_path:
-            log.info(f"Power ceiling control file: {self.ceiling_path} "
-                     "(write watts or 'none'; SIGHUP re-reads immediately)")
+                self._release_to_default(source)
         if self.budget_w is not None and self.ceiling_w and self.fallback_w > min(self.ceiling_w):
             log.info(f"  note: --power-fallback {self.fallback_w:.0f} W sits above the "
                      "ceiling and will be clamped to it when the UPS is unreadable")
 
         self.learned_cap_w = min(self.applied_w) if self.applied_w else None
         self._last_limit_change = time.monotonic()
-
-        # Ceiling-only mode has no sensor to wait for — land on the cap immediately.
         if self.budget_w is None:
             self._hold_ceiling()
 
-    # ───────────────────────── ceiling machinery ─────────────────────────
-    # The ceiling is applied by SHRINKING max_w, never by clamping at the decision
-    # sites: _set_limit() and every control path already bound writes to max_w, so one
-    # assignment caps the whole actuator surface — the UPS restore branch, the idle
-    # reset, the thermal derate, --power-fallback and the floor-flag clamp. Any future
-    # code that sets a power limit MUST go through _set_limit() to inherit the cap.
-
-    def _apply_ceiling(self, request: Optional[List[float]], source: str):
+    # ── the ceiling ──
+    def apply_ceiling(self, request: Optional[List[float]], source: str):
         """Make `request` the active ceiling. None unpins (back to the hardware max)."""
         n = len(self.handles)
         if request is None:
@@ -456,10 +627,8 @@ class PowerGovernor:
             self._hold_log_pending = True
             log.info(f"POWER: ceiling cleared ({source}) — upper limit back to hardware max "
                      + "/".join(f"{w:.0f}" for w in self.hw_max_w) + " W")
-            # Let the UPS restore branch reconsider promptly rather than sitting out a
-            # 30 s dwell that was armed by the (now irrelevant) ceiling change.
             self._headroom_ticks = 0
-            if self.budget_w is None:
+            if self.budget_w is None and not self._holding():
                 self._release_to_default(source)
             return
 
@@ -491,110 +660,92 @@ class PowerGovernor:
                  + f" W per GPU ({source}; hardware max "
                  + "/".join(f"{w:.0f}" for w in self.hw_max_w) + " W)")
 
-        # A lowered ceiling takes effect NOW — it is a safety bound, not a control
-        # target, so it is never slew-limited. Raising it is left to the normal restore
-        # path so the UPS still supervises the way back up.
+        # A lowered ceiling takes effect NOW: it's a safety bound, not a control target.
+        # Raising it is left to the normal restore path so the UPS supervises the way up.
         for i in range(n):
             if self.applied_w[i] > self.max_w[i] + 0.5:
                 self._set_limit(i, self.max_w[i])
-        # The learned common cap must never sit above the ceiling, or the restore branch
-        # would keep targeting a value the ceiling forbids.
         if self.learned_cap_w is not None:
             self.learned_cap_w = min(self.learned_cap_w, min(self.max_w))
         if self.budget_w is None:
             self._hold_ceiling()
 
-    def _release_to_default(self, source: str):
-        """Hand the cards back to their default limit.
+    def _holding(self) -> bool:
+        return self.emergency_active or self.thermal_limited
 
-        Only used in ceiling-only mode. With a UPS budget the restore branch walks the
-        limits back up under supervision, but with no sensor nothing else ever raises a
-        limit — so without this an unpin would silently leave the GPUs parked at the
-        old cap forever, which is the opposite of what the operator asked for.
+    def _release_to_default(self, source: str):
+        """Hand the cards back to their default limit (no ceiling, no UPS budget).
+
+        With a budget the restore branch walks limits up under supervision, but with no
+        sensor nothing else ever raises a limit, so an unpin would otherwise leave the
+        GPUs parked at the old cap forever.
         """
         for i in range(len(self.handles)):
             if abs(self.applied_w[i] - self.default_w[i]) >= 1.0:
                 self._set_limit(i, self.default_w[i])
         if self.applied_w:
             self.learned_cap_w = min(self.applied_w)
-        log.info(f"POWER: no ceiling and no UPS budget ({source}) — GPUs returned to their "
+        log.info(f"POWER: no ceiling and no UPS budget ({source}) — GPUs at their "
                  "default limit " + "/".join(f"{w:.0f}" for w in self.applied_w) + "W")
 
+    def _walk_step(self, now: float) -> bool:
+        """One recovery-walk step towards the walk target. Returns True when it's done."""
+        if self.learned_cap_w is None:
+            return True
+        top = min(self._walk_targets())
+        if self.learned_cap_w >= top - 0.5:
+            return True
+        if now - self._last_limit_change < POWER_RESTORE_DWELL_S:
+            return False
+        self.learned_cap_w = min(top, self.learned_cap_w + POWER_SLEW_UP_W)
+        for i in range(len(self.handles)):
+            self._set_limit(i, min(self._walk_targets()[i], self.learned_cap_w))
+        self._last_limit_change = now
+        log.info(f"POWER: recovering after a hold, +{POWER_SLEW_UP_W:.0f} W -> "
+                 + "/".join(f"{w:.0f}" for w in self.applied_w) + "W")
+        return self.learned_cap_w >= top - 0.5
+
+    def _walk_targets(self) -> List[float]:
+        if self.ceiling_w is not None:
+            return list(self.ceiling_w)
+        if self.budget_w is None:
+            return list(self.default_w)
+        return list(self.max_w)
+
     def _hold_ceiling(self):
-        """Ceiling-only mode: park every GPU on its cap. Idempotent, logs on change."""
-        if self.ceiling_w is None:
+        """No UPS budget: park every GPU on its cap. Idempotent; logs on change."""
+        now = time.monotonic()
+        if self.emergency_active:
+            targets = list(self.min_w)
+        elif self.thermal_limited and self.learned_cap_w is not None:
+            targets = [min(t, self.learned_cap_w) for t in self._walk_targets()]
+        elif self.recovery_walk:
+            if self._walk_step(now):
+                self.recovery_walk = False
+                log.info("POWER: recovery complete")
             return
-        # Thermal derating owns the cap while it is engaged. Pushing back up to the
-        # ceiling here would undo the derate every tick and oscillate against the
-        # thermal loop; observe_thermal() clears the hold once the card has cooled.
-        if self._thermal_limited and self.learned_cap_w is not None:
-            targets = [min(self.ceiling_w[i], self.learned_cap_w) for i in range(len(self.handles))]
-        else:
+        elif self.ceiling_w is not None:
             targets = list(self.ceiling_w)
+        else:
+            return
         before = tuple(self.applied_w)
         for i in range(len(self.handles)):
             self._set_limit(i, targets[i])
         if self.applied_w:
             self.learned_cap_w = min(self.applied_w)
         if tuple(self.applied_w) != before or self._hold_log_pending:
-            log.info("POWER: holding ceiling (no UPS sensor), limits "
+            log.info("POWER: holding (no UPS budget), limits "
                      + "/".join(f"{w:.0f}" for w in self.applied_w) + "W"
-                     + ("  [thermal derate active]" if self._thermal_limited else ""))
+                     + ("  [EMERGENCY]" if self.emergency_active else
+                        "  [thermal derate active]" if self.thermal_limited else ""))
             self._hold_log_pending = False
 
-    def _ceiling_file_stamp(self) -> Optional[Tuple[int, int]]:
-        if not self.ceiling_path:
-            return None
-        try:
-            st = os.stat(self.ceiling_path)
-            return (st.st_mtime_ns, st.st_size)
-        except FileNotFoundError:
-            return None
-        except OSError:
-            return self._ceiling_stamp     # transient stat error: assume unchanged
-
-    def _refresh_ceiling_from_file(self, force: bool = False):
-        """Pick up live edits to the control file. Cheap enough to run every tick."""
-        if not self.ceiling_path:
-            return
-        stamp = self._ceiling_file_stamp()
-        if not force and stamp == self._ceiling_stamp:
-            return
-        self._ceiling_stamp = stamp
-        if stamp is None:
-            self._apply_ceiling(None, "control file removed")
-            return
-        ok, request = read_ceiling_file(self.ceiling_path)
-        if not ok:
-            return                          # garbage/unreadable: keep the active cap
-        if request != self.ceiling_request:
-            self._apply_ceiling(request, f"control file {self.ceiling_path}")
-
-    def _write_ceiling_file(self):
-        """Persist the active ceiling so it can be re-applied after a reboot."""
-        if not self.ceiling_path or self.dry_run:
-            return
-        text = ("none" if self.ceiling_request is None
-                else ",".join(f"{w:.0f}" for w in self.ceiling_request))
-        tmp = self.ceiling_path + ".tmp"
-        try:
-            os.makedirs(os.path.dirname(self.ceiling_path) or ".", exist_ok=True)
-            with open(tmp, "w") as f:
-                f.write(text + "\n")
-            os.replace(tmp, self.ceiling_path)
-            self._ceiling_stamp = self._ceiling_file_stamp()
-        except OSError as e:
-            log.warning(f"⚠ POWER: could not persist ceiling to {self.ceiling_path}: {e} "
-                        "— the ceiling is active but will NOT survive a restart")
-
-    def _enforce_ceiling(self):
+    def enforce_ceiling(self):
         """Re-assert the cap against out-of-band changes, e.g. a manual `nvidia-smi -pl`.
 
-        applied_w is a cache of what THIS daemon last wrote, so _set_limit()'s
-        "already there" early-return is blind to anyone else moving the limit. A ceiling
-        is a guarantee, not a preference: if it is in force it has to hold regardless of
-        who changed the limit, so re-read the hardware and correct upward violations.
-        Downward external changes are left alone — the control loop already owns those.
+        applied_w is a cache of what THIS daemon last wrote, so _set_limit()'s "already
+        there" early-return is blind to anyone else moving the limit. A ceiling is a
+        guarantee, so re-read the hardware and correct upward violations.
         """
         if self.ceiling_w is None or self.dry_run:
             return
@@ -607,19 +758,15 @@ class PowerGovernor:
             if actual > self.max_w[i] + 0.5:
                 log.warning(f"⚠ POWER: GPU {i} limit is {actual:.0f} W, above the "
                             f"{self.max_w[i]:.0f} W ceiling — changed out of band; re-applying")
-                self.applied_w[i] = actual        # resync so _set_limit actually writes
+                self.applied_w[i] = actual
                 self._set_limit(i, self.max_w[i])
-
-    def request_reload(self):
-        """SIGHUP: re-read the control file on the next loop iteration."""
-        self._reload_requested = True
 
     def _set_limit(self, idx: int, watts: float):
         watts = max(self.min_w[idx], min(self.max_w[idx], watts))
         if abs(watts - self.applied_w[idx]) < 1.0:
             return
         if self.dry_run:
-            log.info(f"  [dry-run] GPU {idx}: would set limit {watts:.0f} W")
+            log.info(f"  [dry-run] GPU {idx}: would set power limit {watts:.0f} W")
             self.applied_w[idx] = watts
             return
         try:
@@ -638,11 +785,8 @@ class PowerGovernor:
         self._idle_since = None
 
     def _read_gpu_power_and_activity(self) -> Optional[Tuple[float, int]]:
-        """Return aggregate board draw and a conservative active-GPU count.
-
-        A failed utilization read is treated as active: it is safer to retain a learned
-        cap than to reset to hardware maximum when we cannot prove that every card is idle.
-        """
+        """Aggregate board draw and a conservative active-GPU count (a failed read counts
+        as active: safer to keep a learned cap than reset to hardware max blind)."""
         total_draw = 0.0
         active_count = 0
         for i, h in enumerate(self.handles):
@@ -657,22 +801,83 @@ class PowerGovernor:
                 active_count += 1
         return total_draw, active_count
 
-    def observe_thermal(self, hottest_c: int, fan_pct: int, target_c: int):
-        """Derate the common cap when maximum cooling cannot hold the target.
-
-        Fan control is the first actuator. Power only falls after the fan has reached
-        100% and temperature reaches THERMAL_POWER_MARGIN_C above target for
-        a dwell. A thermal reduction arms the same fresh-UPS-feedback gate as an UPS
-        reduction, preventing the two control inputs from reacting twice to one stale
-        whole-system reading.
-        """
-        if self.learned_cap_w is None or not self.min_w:
+    # ── temperature ──
+    def observe_emergency(self, hottest_c: int, emergency_c: int):
+        """Always armed. Emergency temperature for EMERGENCY_DWELL_S -> every GPU to min."""
+        if not self.min_w:
             return
         now = time.monotonic()
-        thermally_over = (
-            fan_pct >= 100
-            and hottest_c >= target_c + THERMAL_POWER_MARGIN_C
-        )
+        if not self.emergency_active:
+            self._emergency_cool_since = None
+            if hottest_c < emergency_c:
+                self._emergency_hot_since = None
+                return
+            if self._emergency_hot_since is None:
+                self._emergency_hot_since = now
+                log.warning(f"⚠ EMERGENCY: hottest {hottest_c}C >= {emergency_c}C; cutting "
+                            f"power if it holds for {EMERGENCY_DWELL_S:.0f}s")
+                return
+            hot_for = now - self._emergency_hot_since
+            if hot_for < EMERGENCY_DWELL_S:
+                return
+            self.emergency_active = True
+            self.recovery_walk = False
+            self.clamp_all(min(self.min_w),
+                           f"EMERGENCY: {hottest_c}C >= {emergency_c}C for {hot_for:.0f}s")
+            log.warning(f"⚠ EMERGENCY: all GPUs at minimum power; released once <= "
+                        f"{emergency_c - EMERGENCY_RELEASE_DROP_C}C for "
+                        f"{EMERGENCY_RELEASE_DWELL_S:.0f}s")
+            return
+
+        # active: keep every card on the floor, and watch for the release
+        for i in range(len(self.handles)):
+            self._set_limit(i, self.min_w[i])
+        release_c = emergency_c - EMERGENCY_RELEASE_DROP_C
+        if hottest_c > release_c:
+            self._emergency_cool_since = None
+            return
+        if self._emergency_cool_since is None:
+            self._emergency_cool_since = now
+            return
+        cool_for = now - self._emergency_cool_since
+        if cool_for >= EMERGENCY_RELEASE_DWELL_S:
+            self.emergency_active = False
+            self._emergency_hot_since = None
+            self._emergency_cool_since = None
+            self.thermal_limited = False
+            self.recovery_walk = True
+            self._last_limit_change = now
+            self._hold_log_pending = True
+            log.info(f"EMERGENCY: {hottest_c}C <= {release_c}C for {cool_for:.0f}s -> cleared; "
+                     f"power walks back up +{POWER_SLEW_UP_W:.0f} W every "
+                     f"{POWER_RESTORE_DWELL_S:.0f}s")
+
+    def observe_thermal(self, hottest_c: int, target_c: Optional[int],
+                        fan_pct: Optional[int] = None, fan_threshold: Optional[int] = None):
+        """Hold the temperature target by cutting power.
+
+        Cuts once the card is >= target + THERMAL_POWER_MARGIN_C for the dwell. With
+        `fan_threshold` (adaptive), the fans must also be at or above it; without it (the
+        fixed curves), the fan speed is irrelevant. A thermal step arms the same
+        fresh-UPS-feedback gate as a UPS step, so one stale whole-system reading can't make
+        both inputs react.
+        """
+        if self.learned_cap_w is None or not self.min_w or self.emergency_active:
+            return
+        now = time.monotonic()
+        if target_c is None:
+            if self.thermal_limited:
+                self.thermal_limited = False
+                self.recovery_walk = True
+                self._last_limit_change = now
+                log.info("THERMAL: temperature target cleared -> thermal hold released")
+            self._thermal_hot_since = None
+            self._thermal_cool_since = None
+            return
+
+        trigger_c = target_c + THERMAL_POWER_MARGIN_C
+        fans_ok = fan_threshold is None or (fan_pct is not None and fan_pct >= fan_threshold)
+        thermally_over = hottest_c >= trigger_c and fans_ok
 
         if thermally_over:
             self._thermal_cool_since = None
@@ -680,28 +885,21 @@ class PowerGovernor:
                 self._thermal_hot_since = now
                 return
             hot_for = now - self._thermal_hot_since
-            required_dwell = (
-                THERMAL_POWER_REPEAT_DWELL_S
-                if self._thermal_limited else THERMAL_POWER_INITIAL_DWELL_S
-            )
+            required_dwell = (THERMAL_POWER_REPEAT_DWELL_S if self.thermal_limited
+                              else THERMAL_POWER_INITIAL_DWELL_S)
             if (hot_for < required_dwell
-                    or (self._thermal_limited
-                        and now - self._last_thermal_step < required_dwell)):
+                    or (self.thermal_limited and now - self._last_thermal_step < required_dwell)):
                 return
-
             before = tuple(self.applied_w)
-            excess_c = max(
-                0, hottest_c - (target_c + THERMAL_POWER_MARGIN_C))
-            step_w = max(
-                THERMAL_POWER_MIN_STEP_W,
-                min(THERMAL_POWER_MAX_STEP_W,
-                    excess_c * THERMAL_POWER_W_PER_EXCESS_C),
-            )
+            excess_c = max(0, hottest_c - trigger_c)
+            step_w = max(THERMAL_POWER_MIN_STEP_W,
+                         min(THERMAL_POWER_MAX_STEP_W, excess_c * THERMAL_POWER_W_PER_EXCESS_C))
             new_cap = max(min(self.min_w), self.learned_cap_w - step_w)
             self.learned_cap_w = new_cap
             for i in range(len(self.handles)):
                 self._set_limit(i, new_cap)
-            self._thermal_limited = True
+            self.thermal_limited = True
+            self.recovery_walk = False
             self._thermal_hot_since = now
             self._last_thermal_step = now
             self._last_limit_change = now
@@ -710,52 +908,57 @@ class PowerGovernor:
                 self._feedback_wait_total_w = total_w
                 self._feedback_wait_status_flags = status_flags
                 self._feedback_wait_since = now
-            log.warning(
-                f"⚠ THERMAL: {hottest_c}C at {fan_pct}% fan for {hot_for:.0f}s "
-                f"(target {target_c}C, excess {excess_c}C) -> "
-                f"-{step_w:.0f} W, learned power cap {new_cap:.0f} W")
+            fans = f" at {fan_pct}% fan" if fan_pct is not None else ""
+            log.warning(f"⚠ THERMAL: {hottest_c}C{fans} for {hot_for:.0f}s (target {target_c}C, "
+                        f"cut at {trigger_c}C) -> -{step_w:.0f} W, power cap {new_cap:.0f} W")
+            if new_cap <= min(self.min_w) + 0.5 and hottest_c >= trigger_c:
+                log.warning("⚠ THERMAL: already at the hardware power floor and still over the "
+                            "target — only the fan profile or the card's own limits can help now")
             return
 
         self._thermal_hot_since = None
-        if not self._thermal_limited:
+        if not self.thermal_limited:
             self._thermal_cool_since = None
             return
-
-        if hottest_c <= target_c - THERMAL_POWER_RECOVER_MARGIN_C:
+        release_c = target_c - THERMAL_POWER_RECOVER_MARGIN_C
+        if hottest_c <= release_c:
             if self._thermal_cool_since is None:
                 self._thermal_cool_since = now
                 return
             cool_for = now - self._thermal_cool_since
             if cool_for >= THERMAL_POWER_RECOVER_DWELL_S:
-                self._thermal_limited = False
+                self.thermal_limited = False
                 self._thermal_cool_since = None
-                log.info(
-                    f"THERMAL: {hottest_c}C <= {target_c - THERMAL_POWER_RECOVER_MARGIN_C}C "
-                    f"for {cool_for:.0f}s -> thermal hold cleared; UPS recovery may resume")
+                self.recovery_walk = True
+                self._last_limit_change = now
+                log.info(f"THERMAL: {hottest_c}C <= {release_c}C for {cool_for:.0f}s -> "
+                         "thermal hold cleared; power walks back up")
         else:
             self._thermal_cool_since = None
 
+    def restore_holds(self, thermal: bool, emergency: bool):
+        """Re-arm holds saved in the runtime state (a restart must not lift them)."""
+        if emergency:
+            self.emergency_active = True
+            self.clamp_all(min(self.min_w), "EMERGENCY hold restored from runtime state")
+        if thermal:
+            self.thermal_limited = True
+            log.info("THERMAL: thermal hold restored from runtime state")
+
+    # ── the UPS loop ──
     def update(self, force: bool = False):
         now = time.monotonic()
-
-        # Polled every call rather than every governor interval: a stat() is far cheaper
-        # than the UPS read, and it lets a benchmark pin/unpin within one fan poll
-        # instead of waiting out --power-interval.
-        if self._reload_requested:
-            self._reload_requested = False
-            self._refresh_ceiling_from_file(force=True)
-        else:
-            self._refresh_ceiling_from_file()
-
         if not force and (now - self._last_run) < self.interval:
             return
         self._last_run = now
 
-        self._enforce_ceiling()
+        self.enforce_ceiling()
 
-        # Ceiling-only mode: no UPS to read and no budget to defend, so there is nothing
-        # to throttle against — just keep the cards parked on the cap. Thermal derating
-        # still runs; it is driven from the fan loop via observe_thermal(), not here.
+        if self.emergency_active:
+            log.info("POWER: EMERGENCY hold, limits "
+                     + "/".join(f"{w:.0f}" for w in self.applied_w) + "W")
+            return
+
         if self.budget_w is None:
             self._hold_ceiling()
             return
@@ -763,14 +966,14 @@ class PowerGovernor:
         reading = self.ups.read()
         if reading is None:
             if self.ups.consecutive_failures >= POWER_MAX_READ_FAILURES:
-                self.clamp_all(self.fallback_w,
-                               f"UPS unreadable x{self.ups.consecutive_failures} (flying blind)")
+                if not self._holding() or self.fallback_w < min(self.applied_w):
+                    self.clamp_all(self.fallback_w,
+                                   f"UPS unreadable x{self.ups.consecutive_failures} (flying blind)")
             return
         total_w, status_flags = reading
         self._last_ups_reading = (total_w, status_flags)
         matched_floor_flags = [flag for flag in self.floor_on_flags if flag in status_flags]
 
-        # ── configured UPS emergency: runtime beats throughput, floor immediately ──
         if matched_floor_flags:
             if not self._was_power_floor:
                 status = " ".join(status_flags) or "(empty)"
@@ -786,17 +989,16 @@ class PowerGovernor:
                      "resuming normal power governing")
             self._was_power_floor = False
 
-        # A power-limit change and the UPS reading are asynchronous. Hold after
-        # every downward step until NUT publishes a different load/status sample;
-        # otherwise a cached total plus falling GPU draw invents rising non-GPU load.
+        # A power-limit change and the UPS reading are asynchronous. Hold after every
+        # downward step until NUT publishes a different sample; otherwise a cached total
+        # plus falling GPU draw invents rising non-GPU load.
         if self._feedback_wait_total_w is not None:
             old_total = self._feedback_wait_total_w
             old_status = self._feedback_wait_status_flags
             elapsed = now - self._feedback_wait_since
             if total_w != old_total or status_flags != old_status:
                 log.info(f"POWER: fresh UPS feedback after throttle: {old_total:.0f}W/"
-                         f"{' '.join(old_status)} -> {total_w:.0f}W/"
-                         f"{' '.join(status_flags)}")
+                         f"{' '.join(old_status)} -> {total_w:.0f}W/{' '.join(status_flags)}")
                 self._feedback_wait_total_w = None
             elif elapsed < POWER_FEEDBACK_TIMEOUT_S:
                 log.info(f"POWER: ups={total_w:.0f}W status={' '.join(status_flags)} — "
@@ -813,26 +1015,28 @@ class PowerGovernor:
         if gpu_state is None:
             return
         gpu_draw, active_gpu_count = gpu_state
-
         non_gpu = max(0.0, total_w - gpu_draw)
 
-        # A learned cap belongs to the current workload. Do not chase low UPS samples
-        # upward while work is active; once every GPU has been genuinely idle for a
-        # full dwell, clear the learned ceiling and make the next job start at MAX.
+        # A learned cap belongs to the current workload. Once every GPU has been idle for
+        # a full dwell, reset to MAX (in steps, if recovering from a hold).
         if active_gpu_count == 0:
             self._over_ticks = 0
             self._headroom_ticks = 0
             if self._idle_since is None:
                 self._idle_since = now
             idle_for = now - self._idle_since
-            if idle_for >= POWER_IDLE_DWELL_S:
+            if idle_for >= POWER_IDLE_DWELL_S and not self.thermal_limited:
+                if self.recovery_walk:
+                    if self._walk_step(now):
+                        self.recovery_walk = False
+                        log.info("POWER: recovery complete")
+                    return
                 changed = False
                 for i in range(len(self.handles)):
                     if abs(self.applied_w[i] - self.max_w[i]) >= 1.0:
                         self._set_limit(i, self.max_w[i])
                         changed = True
                 self.learned_cap_w = min(self.applied_w) if self.applied_w else None
-                self._thermal_limited = False
                 self._thermal_hot_since = None
                 self._thermal_cool_since = None
                 if changed:
@@ -850,7 +1054,6 @@ class PowerGovernor:
         if self.learned_cap_w is None:
             self.learned_cap_w = min(self.applied_w)
 
-        # ── REACTIVE: trim the common cap by the measured whole-system excess ──
         over = total_w - self.budget_w
         if over > POWER_DEADBAND_W:
             self._headroom_ticks = 0
@@ -861,9 +1064,6 @@ class PowerGovernor:
                          "letting it pass, limits held "
                          + "/".join(f"{w:.0f}" for w in self.applied_w) + "W")
                 return
-            # Split the observed UPS excess only across cards that are actually drawing
-            # power. All cards keep one common ceiling, but idle cards no longer dilute
-            # the correction applied to the active workload.
             target = self.learned_cap_w - (over / active_gpu_count)
             mode = "throttle"
         else:
@@ -875,21 +1075,19 @@ class PowerGovernor:
                          f"budget={self.budget_w:.0f}W -> learned ceiling steady, limits held "
                          + "/".join(f"{w:.0f}" for w in self.applied_w) + "W")
                 return
-
             if self.learned_cap_w >= max_common_cap:
                 self._headroom_ticks = 0
+                self.recovery_walk = False
                 log.info(f"POWER: ups={total_w:.0f}W gpu={gpu_draw:.0f}W other={non_gpu:.0f}W "
                          f"budget={self.budget_w:.0f}W -> headroom, already at MAX "
                          + "/".join(f"{w:.0f}" for w in self.applied_w) + "W")
                 return
-
-            if self._thermal_limited:
+            if self.thermal_limited:
                 self._headroom_ticks = 0
                 log.info(f"POWER: ups={total_w:.0f}W gpu={gpu_draw:.0f}W other={non_gpu:.0f}W "
                          f"budget={self.budget_w:.0f}W -> thermal hold, learned limits held "
                          + "/".join(f"{w:.0f}" for w in self.applied_w) + "W")
                 return
-
             self._headroom_ticks += 1
             since_change = now - self._last_limit_change
             if (self._headroom_ticks < POWER_RESTORE_HEADROOM_TICKS
@@ -900,7 +1098,6 @@ class PowerGovernor:
                          f"{since_change:.0f}/{POWER_RESTORE_DWELL_S:.0f}s; learned limits held "
                          + "/".join(f"{w:.0f}" for w in self.applied_w) + "W")
                 return
-
             target = min(max_common_cap, self.learned_cap_w + POWER_SLEW_UP_W)
             self._headroom_ticks = 0
             mode = "restore"
@@ -911,14 +1108,9 @@ class PowerGovernor:
             want = max(self.min_w[i], min(self.max_w[i], target))
             delta = want - cur
             if abs(delta) < POWER_DEADBAND_W:
-                # The deadband applies to whole-system error. With multiple active GPUs,
-                # the per-card share may be smaller while the aggregate correction is
-                # still required (for example 20 W excess / 2 cards = 10 W each).
                 if mode == "throttle" and delta < 0:
                     self._set_limit(i, want)
                     continue
-                # MAX is an exact hardware state, not a noisy sensor target. Permit
-                # the final in-deadband restoration step (for example 590 -> 600 W).
                 if mode == "restore" and delta > 0 and want == self.max_w[i]:
                     self._set_limit(i, want)
                 continue
@@ -943,14 +1135,19 @@ class PowerGovernor:
                  + "/".join(f"{w:.0f}" for w in self.applied_w) + "W")
 
     def restore_defaults(self):
+        """On exit. A pinned ceiling outlives the process (`nvidia-smi -pl` semantics), and
+        so does a thermal or emergency hold: stopping the service must never RAISE power
+        on a hot card."""
         if self.dry_run:
             return
+        if self._holding():
+            log.info("Power hold active (" + ("EMERGENCY" if self.emergency_active else "thermal")
+                     + ") — leaving the lowered limits in place: "
+                     + "/".join(f"{w:.0f}" for w in self.applied_w) + " W")
+            return
         if self.ceiling_w is not None:
-            # `nvidia-smi -pl` semantics: a pinned ceiling outlives the process, so
-            # stopping the service must not silently un-pin a running benchmark.
             log.info("Power ceiling active — leaving GPUs pinned instead of restoring "
-                     "card defaults (unpin with --power-ceiling none, or write 'none' "
-                     "to the ceiling file)")
+                     "card defaults (unpin by writing 'none' to the ceiling file)")
             for i, h in enumerate(self.handles):
                 try:
                     pynvml.nvmlDeviceSetPowerManagementLimit(h, int(self.ceiling_w[i] * 1000))
@@ -967,523 +1164,779 @@ class PowerGovernor:
                 log.error(f"  GPU {i}: could not restore power limit: {e}")
 
 
-class NvidiaFanController:
-    def __init__(self, curve: List[Tuple[int, int]], poll_interval: float = 2.0,
-                 sync: bool = True, mirror: bool = False, governor=None,
-                 temp_target: Optional[int] = None):
-        self.curve = sorted(curve, key=lambda x: x[0])
-        self.poll_interval = poll_interval
-        # sync=True (default): ALL fans track the HOTTEST card ("perform as one card").
-        # For back-to-back cards this stops an idle neighbour's slow fan from choking
-        # the hot card's airflow. sync=False = upstream per-card independent behaviour.
-        self.sync = sync
-        # mirror=True: NO custom curve at all. Keep the HOTTER card on its own factory
-        # (auto) curve, read the speed it chooses, and set the COOLER card to match.
-        # Roles swap when the temps cross. The only curve in play is the card's own.
-        self.mirror = mirror
-        # A configured target supersedes mirror/factory policy. Both cards become one
-        # manually controlled thermal zone with asymmetric fan slew.
-        self.temp_target = temp_target
-        self._commanded_fan_pct: Optional[int] = None
-        self._target_trim_pct = 0.0
-        # Optional PowerGovernor. Deliberately driven from THIS loop rather than a
-        # second daemon: capping power lowers temperature, so two independent
-        # controllers would be reacting to each other's output.
-        self.governor = governor
-        self.running = False
-        self.handles = []
-        self.fan_counts = []
+# ─────────────────────────── FAN CONTROLLER ───────────────────────────
 
+class FanController:
+    """Drives the fans from the live settings, and feeds temperatures to the governor.
+
+    Deliberately one loop with the governor rather than a second daemon: cutting power
+    lowers temperature, so two independent controllers would react to each other.
+    """
+
+    def __init__(self, store: SettingsStore, governor: PowerGovernor,
+                 poll_interval: float = 2.0, emergency_c: int = DEFAULT_TEMP_EMERGENCY_C,
+                 state_dir: str = DEFAULT_STATE_DIR, run_dir: str = DEFAULT_RUN_DIR,
+                 dry_run: bool = False):
+        self.store = store
+        self.governor = governor
+        self.poll_interval = poll_interval
+        self.emergency_c = emergency_c
+        self.state_dir = state_dir
+        self.run_dir = run_dir
+        self.dry_run = dry_run
+        self.handles: List = []
+        self.fan_counts: List[int] = []
+        # what is in force (after validation), vs what the settings ask for
+        self.profile = FanProfile(DEFAULT_PROFILE)
+        self.mirror = False
+        self.target: Optional[int] = None
+        self.requested_profile = FanProfile(DEFAULT_PROFILE)
+        # fan state
+        self._manual: Dict[int, Optional[bool]] = {}     # gpu -> policy we last set
+        self._speed: Dict[int, int] = {}                  # gpu -> % we last set
+        self._settle: Dict[int, bool] = {}                # gpu -> easing down after a switch
+        self._commanded_fan_pct: Optional[int] = None     # adaptive (one zone)
+        self._target_trim_pct = 0.0
+        self._pending_trim: Optional[Tuple[int, float]] = None
+        self.last_fan_pct: Optional[int] = None
+        self.last_temps: Dict[int, int] = {}
+        self.messages: List[str] = []
+        self._written_generation = -1
+        self.running = False
+        self._last_runtime_save = 0.0
+
+    # ── setup ──
     def init(self):
-        """Initialize NVML and get GPU handles"""
         pynvml.nvmlInit()
         count = pynvml.nvmlDeviceGetCount()
-
         log.info(f"Found {count} NVIDIA GPU(s)")
-
         for i in range(count):
             handle = pynvml.nvmlDeviceGetHandleByIndex(i)
             name = pynvml.nvmlDeviceGetName(handle)
             fan_count = pynvml.nvmlDeviceGetNumFans(handle)
-
             self.handles.append(handle)
             self.fan_counts.append(fan_count)
-
+            self._manual[i] = None
             log.info(f"  GPU {i}: {name} ({fan_count} fans)")
+        log.info(f"Poll interval: {self.poll_interval}s; emergency temperature "
+                 f"{self.emergency_c}C (fixed, set by the deployment)")
 
-            # Target and explicit-curve modes own every fan. Plain mirror mode manages
-            # policy per poll so the hotter card can remain on factory auto.
-            if self.temp_target is not None or not self.mirror:
-                for fan_idx in range(fan_count):
-                    try:
-                        pynvml.nvmlDeviceSetFanControlPolicy(
-                            handle, fan_idx, pynvml.NVML_FAN_POLICY_MANUAL
-                        )
-                    except pynvml.NVMLError as e:
-                        log.warning(f"    Could not set manual control for fan {fan_idx}: {e}")
+        changes, _ = self.store.refresh()
+        ceiling, csource = self.store.resolve("ceiling")
+        self.governor.handles = self.handles
+        self.governor.init(ceiling, describe_source(self.store, "ceiling", csource))
+        self._apply([c for c in changes if c[0] != "ceiling"], [], startup=True)
+        self._restore_runtime_state()
+        self._write_effective()
 
-        if self.temp_target is not None:
-            log.info(f"Temperature target: {self.temp_target}C (manual sync, "
-                     f"fan slew +{TARGET_FAN_SLEW_UP_PCT}/-{TARGET_FAN_SLEW_DOWN_PCT}% per poll)")
+    # ── settings ──
+    def _note(self, message: str, warning: bool = False):
+        (log.warning if warning else log.info)(message)
+        self.messages = (self.messages + [message])[-10:]
+
+    def _apply(self, changes, masked, startup: bool = False):
+        by_name = {name: (value, source) for name, value, source in changes}
+        for name, value, source in masked:
+            text = format_setting(name, value)
+            live, _ = self.store.resolve(name)
+            what = {"profile": "FAN: profile", "mirror": "FAN: mirror",
+                    "target": "TEMP: target", "ceiling": "POWER: ceiling"}[name]
+            if source == "override":
+                hidden = (f"masked until restart by a temporary override "
+                          f"({format_setting(name, live)})")
+            else:
+                hidden = (f"masked by a command-line flag ({format_setting(name, live)}); remove "
+                          f"the flag from the unit for the saved setting to apply")
+            self._note(f"{what} set to {text} in the saved settings — {hidden}")
+        if "ceiling" in by_name:
+            value, source = by_name["ceiling"]
+            self.governor.apply_ceiling(value, describe_source(self.store, "ceiling", source))
+        if "target" in by_name:
+            value, source = by_name["target"]
+            self._set_target(value, describe_source(self.store, "target", source))
+        if "mirror" in by_name:
+            value, source = by_name["mirror"]
+            if value != self.mirror or startup:
+                self.mirror = value
+                self._note(f"FAN: mirror {'on' if value else 'off'} "
+                           f"({describe_source(self.store, 'mirror', source)})")
+                self._begin_switch()
+        if "profile" in by_name:
+            value, source = by_name["profile"]
+            self.requested_profile = value
+        if "profile" in by_name or "target" in by_name or startup:
+            source = self.store.resolve("profile")[1]
+            self._resolve_profile(describe_source(self.store, "profile", source), startup)
+
+    def _set_target(self, value: Optional[int], source: str):
+        highest = self.emergency_c - THERMAL_POWER_MARGIN_C - 1
+        if value is not None and value > highest:
+            self._note(f"TEMP: ignoring target {value}C ({source}) — it must be at most "
+                       f"{highest}C, so the target+{THERMAL_POWER_MARGIN_C}C cut comes before the "
+                       f"{self.emergency_c}C emergency; keeping "
+                       + (f"{self.target}C" if self.target is not None else "no target"), True)
+            return
+        if value == self.target:
+            return
+        self.target = value
+        if value is None:
+            self._note(f"TEMP: target cleared ({source})")
         else:
-            log.info(f"Fan curve: {self.curve}")
-        log.info(f"Poll interval: {self.poll_interval}s")
+            self._note(f"TEMP: target set to {value}C ({source}); power is cut at "
+                       f"{value + THERMAL_POWER_MARGIN_C}C held for "
+                       f"{THERMAL_POWER_INITIAL_DWELL_S:.0f}s")
 
-        if self.governor:
-            self.governor.handles = self.handles
-            self.governor.init()
+    def _resolve_profile(self, source: str, startup: bool):
+        want = self.requested_profile
+        if want.name == "adaptive" and self.target is None:
+            if self.profile.name == "adaptive":
+                self._note(f"⚠ FAN: temp target cleared while the profile is adaptive -> falling "
+                           f"back to native (adaptive needs a target)", True)
+                self._switch_profile(FanProfile("native"), "fallback")
+            else:
+                self._note(f"FAN: ignoring profile adaptive ({source}) — it needs a temp target; "
+                           f"keeping {self.profile.describe()}", True)
+            return
+        if want == self.profile and not startup:
+            return
+        self._switch_profile(want, source)
 
-    def get_fan_speed_for_temp(self, temp: int) -> int:
-        """Calculate fan speed based on temperature using the curve"""
-        if temp <= self.curve[0][0]:
-            return self.curve[0][1]
+    def _switch_profile(self, profile: FanProfile, source: str):
+        leaving_adaptive = self.profile.name == "adaptive" and profile.name != "adaptive"
+        self.profile = profile
+        self._note(f"FAN: profile set to {profile.describe()} ({source})")
+        if profile.name == "adaptive":
+            self._commanded_fan_pct = None     # re-seeded from the measured speed
+            if self._pending_trim and self._pending_trim[0] == self.target:
+                self._target_trim_pct = self._pending_trim[1]
+                log.info(f"FAN: adaptive trim restored from runtime state "
+                         f"({self._target_trim_pct:+.1f}%)")
+            self._pending_trim = None
+        elif leaving_adaptive:
+            self._target_trim_pct = 0.0
+        self._begin_switch()
 
-        if temp >= self.curve[-1][0]:
-            return self.curve[-1][1]
+    def _begin_switch(self):
+        # our tables start from the speed the fans are running at, so there's no step down
+        for gpu in range(len(self.handles)):
+            self._settle[gpu] = True
+            self._speed.pop(gpu, None)
 
-        # Linear interpolation between curve points
-        for i in range(len(self.curve) - 1):
-            t1, s1 = self.curve[i]
-            t2, s2 = self.curve[i + 1]
+    # ── fan I/O ──
+    def _read_temps(self) -> Dict[int, int]:
+        temps = {}
+        for gpu, handle in enumerate(self.handles):
+            try:
+                temps[gpu] = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+            except pynvml.NVMLError as e:
+                log.error(f"GPU {gpu}: Error reading temperature: {e}")
+        return temps
 
+    def _read_speed(self, gpu: int) -> Optional[int]:
+        try:
+            return pynvml.nvmlDeviceGetFanSpeed_v2(self.handles[gpu], 0)
+        except pynvml.NVMLError:
+            return None
+
+    def _set_policy(self, gpu: int, manual: bool):
+        if self._manual.get(gpu) == manual:
+            return
+        if self.dry_run:
+            self._manual[gpu] = manual
+            log.info(f"  [dry-run] GPU {gpu}: would set fan policy "
+                     + ("manual" if manual else "factory"))
+            return
+        policy = (pynvml.NVML_FAN_POLICY_MANUAL if manual
+                  else pynvml.NVML_FAN_POLICY_TEMPERATURE_CONTINOUS_SW)
+        try:
+            for fan in range(self.fan_counts[gpu]):
+                pynvml.nvmlDeviceSetFanControlPolicy(self.handles[gpu], fan, policy)
+            self._manual[gpu] = manual
+            if not manual:
+                self._speed.pop(gpu, None)
+        except pynvml.NVMLError as e:
+            self._manual[gpu] = None       # unknown: retry next tick
+            log.error(f"GPU {gpu}: could not set fan policy: {e}")
+
+    def _set_speed(self, gpu: int, pct: int):
+        pct = max(0, min(100, int(pct)))
+        self._set_policy(gpu, True)
+        if self._speed.get(gpu) == pct and not self.dry_run:
+            return
+        if self.dry_run:
+            if self._speed.get(gpu) != pct:
+                log.info(f"  [dry-run] GPU {gpu}: would set fans {pct}%")
+            self._speed[gpu] = pct
+            return
+        try:
+            for fan in range(self.fan_counts[gpu]):
+                pynvml.nvmlDeviceSetFanSpeed_v2(self.handles[gpu], fan, pct)
+            self._speed[gpu] = pct
+        except pynvml.NVMLError as e:
+            self._speed.pop(gpu, None)
+            log.error(f"GPU {gpu}: could not set fan speed {pct}%: {e}")
+
+    @staticmethod
+    def curve_pct(curve: List[Tuple[int, int]], temp: int) -> int:
+        points = sorted(curve)
+        if temp <= points[0][0]:
+            return points[0][1]
+        if temp >= points[-1][0]:
+            return points[-1][1]
+        for (t1, s1), (t2, s2) in zip(points, points[1:]):
             if t1 <= temp <= t2:
-                # Linear interpolation
-                ratio = (temp - t1) / (t2 - t1)
-                return int(s1 + ratio * (s2 - s1))
+                return int(s1 + (temp - t1) / (t2 - t1) * (s2 - s1))
+        return points[-1][1]
 
-        return self.curve[-1][1]
+    def _eased(self, gpu: int, want: int) -> int:
+        """After a switch, come down from the current speed gently instead of stepping."""
+        if not self._settle.get(gpu):
+            return want
+        current = self._speed.get(gpu)
+        if current is None:
+            current = self._read_speed(gpu)
+        if current is None or want >= current:
+            self._settle[gpu] = False
+            return want
+        eased = max(want, current - TARGET_FAN_SLEW_DOWN_PCT)
+        if eased == want:
+            self._settle[gpu] = False
+        return eased
+
+    # ── one tick ──
+    def update(self):
+        changes, masked = self.store.refresh()
+        if changes or masked:
+            self._apply(changes, masked)
+        if changes or masked or self.store.generation != self._written_generation:
+            self._write_effective()
+        temps = self._read_temps()
+        if not temps:
+            return
+        self.last_temps = temps
+        hottest = max(temps.values())
+        self.governor.observe_emergency(hottest, self.emergency_c)
+        fan_pct, fan_threshold = self._update_fans(temps, hottest)
+        self.last_fan_pct = fan_pct
+        self.governor.observe_thermal(hottest, self.target, fan_pct, fan_threshold)
+
+    def _update_fans(self, temps: Dict[int, int], hottest: int) -> Tuple[Optional[int], Optional[int]]:
+        """Drive the fans. Returns (the fan % we command, if any; adaptive's fan max)."""
+        emergency = hottest >= self.emergency_c
+        name = self.profile.name
+
+        if name == "adaptive":
+            return self._update_adaptive(hottest), self.profile.fan_max
+
+        if name == "native":
+            if not self.mirror:
+                # hands off: the card's own factory curve, even in an emergency
+                for gpu in temps:
+                    self._set_policy(gpu, False)
+                log.info(f"fans: native (factory, hands off) hottest={hottest}C")
+                return None, None
+            return self._update_native_mirror(temps, emergency), None
+
+        curve = CURVES[name]
+        if self.mirror:
+            shared = 100 if emergency else self.curve_pct(curve, hottest)
+            for gpu in temps:
+                self._set_speed(gpu, 100 if emergency else self._eased(gpu, shared))
+            label = "EMERGENCY 100%" if emergency else f"{self._speed.get(next(iter(temps)), shared)}%"
+            log.info(f"fans: {name} mirror hottest={hottest}C -> {label}")
+            return max(self._speed.get(g, shared) for g in temps), None
+        commanded = []
+        for gpu, temp in temps.items():
+            want = 100 if temp >= self.emergency_c else self._eased(gpu, self.curve_pct(curve, temp))
+            self._set_speed(gpu, want)
+            commanded.append(want)
+        log.info(f"fans: {name} per-card " + " ".join(
+            f"GPU{g} {temps[g]}C->{self._speed.get(g, '?')}%" for g in temps))
+        return max(commanded), None
+
+    def _update_native_mirror(self, temps: Dict[int, int], emergency: bool) -> Optional[int]:
+        if len(temps) < 2:
+            for gpu in temps:
+                self._set_policy(gpu, False)
+            return None
+        hotter = max(temps, key=temps.get)
+        cooler = min(temps, key=temps.get)
+        if emergency:
+            for gpu in (hotter, cooler):
+                self._set_speed(gpu, 100)
+            log.warning(f"⚠ fans: native mirror EMERGENCY hottest={temps[hotter]}C -> both 100%")
+            return 100
+        self._set_policy(hotter, False)
+        native_fan = self._read_speed(hotter)
+        if native_fan is None:
+            return None
+        self._set_speed(cooler, native_fan)
+        log.info(f"fans: native mirror GPU{hotter}(hot,factory) {temps[hotter]}C fan={native_fan}% "
+                 f"-> GPU{cooler} {temps[cooler]}C set {native_fan}%")
+        return native_fan
 
     def get_target_fan_demand(self, temp: int) -> int:
-        """Map temperature to a safe feed-forward demand below the configured target."""
-        if self.temp_target is None:
-            raise RuntimeError("temperature target is not configured")
-        if temp >= CRITICAL_TEMP:
-            return 100
-        approach_start = self.temp_target - TARGET_FAN_APPROACH_BAND_C
+        """adaptive's feed-forward ramp: 30% at target-20C, rising to 100% at the target."""
+        approach_start = self.target - TARGET_FAN_APPROACH_BAND_C
         if temp <= approach_start:
             return TARGET_FAN_MIN_PCT
         ratio = (temp - approach_start) / TARGET_FAN_APPROACH_BAND_C
-        demand = TARGET_FAN_MIN_PCT + ratio * (100 - TARGET_FAN_MIN_PCT)
-        return max(TARGET_FAN_MIN_PCT, min(100, round(demand)))
+        return max(TARGET_FAN_MIN_PCT, min(100, round(TARGET_FAN_MIN_PCT + ratio * (100 - TARGET_FAN_MIN_PCT))))
 
-    def update_fans_target(self):
-        """Hold one configurable temperature target with asymmetric fan slew.
-
-        Both cards use the hottest temperature and the same command. Upward changes
-        are fast; downward changes are intentionally slow. The absolute critical
-        boundary still bypasses slew and commands 100% immediately.
-        """
-        temps = {}
-        for gpu_idx, handle in enumerate(self.handles):
-            try:
-                temps[gpu_idx] = pynvml.nvmlDeviceGetTemperature(
-                    handle, pynvml.NVML_TEMPERATURE_GPU)
-            except pynvml.NVMLError as e:
-                log.error(f"GPU {gpu_idx}: Error reading temperature: {e}")
-        if not temps:
-            return
-
-        hottest = max(temps.values())
-        base_demand = self.get_target_fan_demand(hottest)
+    def _update_adaptive(self, hottest: int) -> int:
+        """The learning controller: hold the card AT the target, never above the fan max.
+        Both cards are one thermal zone (v1)."""
+        fan_max = self.profile.fan_max
+        base = self.get_target_fan_demand(hottest)
         if self._commanded_fan_pct is None:
-            measured = []
-            for handle in self.handles:
-                try:
-                    measured.append(pynvml.nvmlDeviceGetFanSpeed_v2(handle, 0))
-                except pynvml.NVMLError:
-                    pass
-            self._commanded_fan_pct = max(measured) if measured else base_demand
+            measured = [s for s in (self._read_speed(g) for g in range(len(self.handles)))
+                        if s is not None]
+            self._commanded_fan_pct = min(fan_max, max(measured)) if measured else min(fan_max, base)
 
-        # Convert the upper-bound-style feed-forward curve into a true temperature
-        # setpoint. Below target, integrate a negative correction so fan speed keeps
-        # falling until the temperature actually reaches the requested value. At the
-        # target the learned correction is held. Above target it unwinds much faster.
-        # Integration starts only near the target to avoid cold-start wind-up.
-        error_c = hottest - self.temp_target
+        error_c = hottest - self.target
         if -TARGET_TRACKING_BAND_C <= error_c < 0:
-            self._target_trim_pct -= (
-                -error_c * TARGET_TRIM_DOWN_PCT_PER_C_S * self.poll_interval)
+            self._target_trim_pct -= (-error_c * TARGET_TRIM_DOWN_PCT_PER_C_S * self.poll_interval)
         elif error_c > 0:
-            self._target_trim_pct += (
-                error_c * TARGET_TRIM_UP_PCT_PER_C_S * self.poll_interval)
-        self._target_trim_pct = max(
-            TARGET_TRIM_MIN_PCT, min(0.0, self._target_trim_pct))
-        demand = round(max(
-            TARGET_FAN_MIN_PCT,
-            min(100.0, base_demand + self._target_trim_pct),
-        ))
+            self._target_trim_pct += (error_c * TARGET_TRIM_UP_PCT_PER_C_S * self.poll_interval)
+        self._target_trim_pct = max(TARGET_TRIM_MIN_PCT, min(0.0, self._target_trim_pct))
+        demand = round(max(TARGET_FAN_MIN_PCT, min(fan_max, base + self._target_trim_pct)))
 
-        if hottest >= CRITICAL_TEMP:
+        emergency = hottest >= self.emergency_c
+        if emergency:
             command = 100
         elif demand > self._commanded_fan_pct:
             command = min(demand, self._commanded_fan_pct + TARGET_FAN_SLEW_UP_PCT)
         else:
             command = max(demand, self._commanded_fan_pct - TARGET_FAN_SLEW_DOWN_PCT)
+        command = command if emergency else min(fan_max, command)
         self._commanded_fan_pct = command
+        for gpu in range(len(self.handles)):
+            self._set_speed(gpu, command)
+        log.info(f"target: hottest={hottest}C target={self.target}C "
+                 f"base={base}% trim={self._target_trim_pct:+.1f}% demand={demand}% "
+                 f"command={command}% max={fan_max}%" + (" EMERGENCY" if emergency else ""))
+        return command
 
-        for gpu_idx, (handle, fan_count) in enumerate(zip(self.handles, self.fan_counts)):
-            for fan_idx in range(fan_count):
-                try:
-                    pynvml.nvmlDeviceSetFanSpeed_v2(handle, fan_idx, command)
-                except pynvml.NVMLError as e:
-                    log.error(f"GPU {gpu_idx} Fan {fan_idx}: Error setting speed: {e}")
+    # ── runtime state ──
+    def _runtime_path(self) -> str:
+        return os.path.join(self.state_dir, RUNTIME_STATE_FILE)
 
-        if self.governor:
-            self.governor.observe_thermal(hottest, command, self.temp_target)
-        critical = " CRITICAL" if hottest >= CRITICAL_TEMP else ""
-        log.info(f"target: hottest={hottest}C target={self.temp_target}C "
-                 f"base={base_demand}% trim={self._target_trim_pct:+.1f}% "
-                 f"demand={demand}% command={command}%{critical}")
-
-    def update_fans(self):
-        """Update fan speeds. sync=True (default): every fan on every GPU tracks the
-        HOTTEST card — coordinated cooling so back-to-back cards behave 'as one'.
-        sync=False: each card follows its own temperature (upstream behaviour)."""
-        # 1. read every GPU's temperature
-        temps = {}
-        for gpu_idx, handle in enumerate(self.handles):
-            try:
-                temps[gpu_idx] = pynvml.nvmlDeviceGetTemperature(
-                    handle, pynvml.NVML_TEMPERATURE_GPU)
-            except pynvml.NVMLError as e:
-                log.error(f"GPU {gpu_idx}: Error reading temperature: {e}")
-        if not temps:
-            return
-
-        # 2. in sync mode, one shared target from the hottest card
-        hottest = max(temps.values())
-        shared_target = self.get_fan_speed_for_temp(hottest)
-        # SAFETY FLOOR — never leave fans low when a card is dangerously hot, whatever
-        # the curve says (protects a too-gentle curve like 'native').
-        if hottest >= CRITICAL_TEMP:
-            shared_target = 100
-            log.warning(f"⚠ SAFETY: hottest={hottest}°C >= {CRITICAL_TEMP}°C -> forcing 100% fan")
-
-        # 3. apply
-        for gpu_idx, (handle, fan_count) in enumerate(zip(self.handles, self.fan_counts)):
-            if gpu_idx not in temps:
-                continue
-            temp = temps[gpu_idx]
-            target_speed = shared_target if self.sync else self.get_fan_speed_for_temp(temp)
-            if not self.sync and temp >= CRITICAL_TEMP:
-                target_speed = 100  # per-card safety floor in independent mode
-            for fan_idx in range(fan_count):
-                try:
-                    pynvml.nvmlDeviceSetFanSpeed_v2(handle, fan_idx, target_speed)
-                except pynvml.NVMLError as e:
-                    log.error(f"GPU {gpu_idx} Fan {fan_idx}: Error setting speed: {e}")
-            log.info(f"GPU {gpu_idx}: {temp}°C -> {target_speed}%"
-                     + (f"  [sync: hottest={hottest}°C]" if self.sync else ""))
-
-    def update_fans_mirror(self):
-        """Mirror mode: keep the HOTTER card on its own factory (auto) curve, read the
-        speed it chooses, and set the COOLER card to match — no custom curve of ours.
-        Roles swap when the temps cross. Safety floor still forces 100% above CRITICAL."""
-        temps = {}
-        for gpu_idx, handle in enumerate(self.handles):
-            try:
-                temps[gpu_idx] = pynvml.nvmlDeviceGetTemperature(
-                    handle, pynvml.NVML_TEMPERATURE_GPU)
-            except pynvml.NVMLError as e:
-                log.error(f"GPU {gpu_idx}: Error reading temperature: {e}")
-        if len(temps) < 2:
-            return  # nothing to mirror with fewer than 2 GPUs
-
-        hotter = max(temps, key=temps.get)
-        cooler = min(temps, key=temps.get)
-
-        # SAFETY FLOOR: both cards to 100% (manual) if the hotter card is critically hot
-        if temps[hotter] >= CRITICAL_TEMP:
-            for gi in (hotter, cooler):
-                for fi in range(self.fan_counts[gi]):
-                    try:
-                        pynvml.nvmlDeviceSetFanControlPolicy(self.handles[gi], fi, pynvml.NVML_FAN_POLICY_MANUAL)
-                        pynvml.nvmlDeviceSetFanSpeed_v2(self.handles[gi], fi, 100)
-                    except pynvml.NVMLError as e:
-                        log.error(f"GPU {gi} Fan {fi}: {e}")
-            log.warning(f"⚠ SAFETY: hottest={temps[hotter]}°C >= {CRITICAL_TEMP}°C -> both fans 100%")
-            return
-
-        # hotter card: back on its OWN factory curve (auto), so it picks its native speed
-        for fi in range(self.fan_counts[hotter]):
-            try:
-                pynvml.nvmlDeviceSetFanControlPolicy(
-                    self.handles[hotter], fi, pynvml.NVML_FAN_POLICY_TEMPERATURE_CONTINOUS_SW)
-            except pynvml.NVMLError as e:
-                log.error(f"GPU {hotter} Fan {fi}: {e}")
-
+    def _restore_runtime_state(self):
         try:
-            native_fan = pynvml.nvmlDeviceGetFanSpeed_v2(self.handles[hotter], 0)
-        except pynvml.NVMLError as e:
-            log.error(f"GPU {hotter}: read fan failed: {e}")
+            with open(self._runtime_path()) as f:
+                state = json.load(f)
+        except FileNotFoundError:
             return
+        except (OSError, ValueError) as e:
+            log.warning(f"⚠ runtime state unreadable ({e}); starting fresh")
+            return
+        age = time.time() - float(state.get("saved_at", 0))
+        adaptive = state.get("adaptive") or {}
+        if adaptive.get("target_c") is not None and adaptive.get("trim_pct") is not None:
+            trim = (int(adaptive["target_c"]), float(adaptive["trim_pct"]))
+            if self.profile.name == "adaptive" and self.target == trim[0]:
+                self._target_trim_pct = max(TARGET_TRIM_MIN_PCT, min(0.0, trim[1]))
+                log.info(f"FAN: adaptive trim restored from runtime state "
+                         f"({self._target_trim_pct:+.1f}% for {trim[0]}C)")
+            else:
+                self._pending_trim = trim
+        if age <= HOLD_RESTORE_MAX_AGE_S:
+            self.governor.restore_holds(
+                thermal=bool((state.get("thermal") or {}).get("limited")),
+                emergency=bool((state.get("emergency") or {}).get("active")))
+        elif (state.get("thermal") or {}).get("limited") or (state.get("emergency") or {}).get("active"):
+            log.info(f"runtime state holds are {age:.0f}s old (> {HOLD_RESTORE_MAX_AGE_S:.0f}s) "
+                     "— not restored")
 
-        # cooler card: manual, mirror the hotter card's native fan (never below its own —
-        # identical cards + monotonic curve mean the hotter temp always demands >= fan)
-        for fi in range(self.fan_counts[cooler]):
-            try:
-                pynvml.nvmlDeviceSetFanControlPolicy(self.handles[cooler], fi, pynvml.NVML_FAN_POLICY_MANUAL)
-                pynvml.nvmlDeviceSetFanSpeed_v2(self.handles[cooler], fi, native_fan)
-            except pynvml.NVMLError as e:
-                log.error(f"GPU {cooler} Fan {fi}: {e}")
+    def save_runtime_state(self, force: bool = False):
+        now = time.monotonic()
+        if self.dry_run or (not force and now - self._last_runtime_save < RUNTIME_SAVE_INTERVAL_S):
+            return
+        self._last_runtime_save = now
+        adaptive = ({"target_c": self.target, "trim_pct": round(self._target_trim_pct, 2)}
+                    if self.profile.name == "adaptive" and self.target is not None
+                    else ({"target_c": self._pending_trim[0], "trim_pct": self._pending_trim[1]}
+                          if self._pending_trim else None))
+        state = {
+            "saved_at": time.time(),
+            "adaptive": adaptive,
+            "thermal": {"limited": self.governor.thermal_limited},
+            "emergency": {"active": self.governor.emergency_active},
+        }
+        try:
+            os.makedirs(self.state_dir, exist_ok=True)
+            _write_atomic(self._runtime_path(), json.dumps(state, indent=1) + "\n")
+        except OSError as e:
+            log.warning(f"⚠ could not save runtime state: {e}")
+        self._write_effective()
 
-        log.info(f"mirror: GPU{hotter}(hot,auto) {temps[hotter]}°C fan={native_fan}% "
-                 f"-> GPU{cooler}(cool) {temps[cooler]}°C set {native_fan}%")
+    def _write_effective(self):
+        if self.dry_run:
+            return
+        settings = {}
+        for name in SETTING_NAMES:
+            value, source = self.store.resolve(name)
+            settings[name] = {"value": format_setting(name, value), "source": source}
+        doc = {
+            "generation": self.store.generation,
+            "pid": os.getpid(),
+            "at": time.time(),
+            "settings": settings,
+            "in_force": {"profile": self.profile.text(), "mirror": "on" if self.mirror else "off",
+                         "target": format_setting("target", self.target),
+                         "ceiling": format_setting("ceiling", self.governor.ceiling_request)},
+            "emergency_c": self.emergency_c,
+            "holds": {"thermal": self.governor.thermal_limited,
+                      "emergency": self.governor.emergency_active,
+                      "recovering": self.governor.recovery_walk},
+            "power_limits_w": [round(w) for w in self.governor.applied_w],
+            "temps_c": [self.last_temps.get(g) for g in range(len(self.handles))],
+            "fan_pct": self.last_fan_pct,
+            "adaptive_trim_pct": (round(self._target_trim_pct, 1)
+                                  if self.profile.name == "adaptive" else None),
+            "messages": self.messages,
+        }
+        try:
+            os.makedirs(self.run_dir, exist_ok=True)
+            _write_atomic(os.path.join(self.run_dir, EFFECTIVE_FILE), json.dumps(doc, indent=1) + "\n")
+            self._written_generation = self.store.generation
+        except OSError as e:
+            log.warning(f"⚠ could not write {EFFECTIVE_FILE}: {e}")
 
+    # ── lifecycle ──
     def restore_auto_control(self):
-        """Restore automatic fan control on all GPUs"""
-        log.info("Restoring automatic fan control...")
-        for gpu_idx, (handle, fan_count) in enumerate(zip(self.handles, self.fan_counts)):
-            for fan_idx in range(fan_count):
+        if self.dry_run:
+            return
+        log.info("Restoring factory fan control...")
+        for gpu, (handle, fan_count) in enumerate(zip(self.handles, self.fan_counts)):
+            for fan in range(fan_count):
                 try:
                     pynvml.nvmlDeviceSetFanControlPolicy(
-                        handle, fan_idx,
-                        pynvml.NVML_FAN_POLICY_TEMPERATURE_CONTINOUS_SW
-                    )
-                    log.info(f"  GPU {gpu_idx} Fan {fan_idx}: Restored to auto")
+                        handle, fan, pynvml.NVML_FAN_POLICY_TEMPERATURE_CONTINOUS_SW)
+                    log.info(f"  GPU {gpu} Fan {fan}: factory curve")
                 except pynvml.NVMLError as e:
-                    log.error(f"  GPU {gpu_idx} Fan {fan_idx}: Could not restore: {e}")
+                    log.error(f"  GPU {gpu} Fan {fan}: could not restore: {e}")
 
     def run(self):
-        """Main control loop"""
         self.running = True
-        log.info("Fan control daemon started.")
-
+        log.info("Fan control + GPU power governor running.")
         try:
             while self.running:
-                if self.temp_target is not None:
-                    self.update_fans_target()
-                elif self.mirror:
-                    self.update_fans_mirror()
-                else:
-                    self.update_fans()
-                if self.governor:
-                    self.governor.update()   # no-ops until its own interval elapses
+                self.update()
+                self.governor.update()
+                self.save_runtime_state()
                 time.sleep(self.poll_interval)
         except KeyboardInterrupt:
             log.info("Interrupted by user")
         finally:
-            if self.governor:
-                self.governor.restore_defaults()
+            self.save_runtime_state(force=True)
+            self.governor.restore_defaults()
             self.restore_auto_control()
             pynvml.nvmlShutdown()
-            log.info("Fan control daemon stopped.")
+            log.info("Stopped.")
 
     def stop(self):
-        """Stop the control loop"""
         self.running = False
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Aggressive NVIDIA GPU Fan Control for Headless Systems"
-    )
-    parser.add_argument(
-        "--mode", "-m",
-        choices=["native", "quiet", "aggressive", "performance", "max"],
-        default="quiet",
-        help="Fan curve: native (match stock, just sync), quiet (default), aggressive, "
-             "performance, or max (100%% always)"
-    )
-    parser.add_argument(
-        "--interval", "-i",
-        type=float,
-        default=2.0,
-        help="Poll interval in seconds (default: 2.0)"
-    )
-    parser.add_argument(
-        "--once",
-        action="store_true",
-        help="Set fans once and exit (don't run as daemon)"
-    )
-    parser.add_argument(
-        "--independent",
-        action="store_true",
-        help="Each card follows its OWN temperature (upstream behaviour). Default is "
-             "sync: every fan tracks the hottest card ('perform as one card')."
-    )
-    parser.add_argument(
-        "--temp-target",
-        type=parse_temp_target,
-        default=None,
-        metavar="CELSIUS",
-        help=f"Own all fans as one thermal zone around a configurable target "
-             f"(50..{CRITICAL_TEMP - 1} C). Overrides --mirror/--mode; fan demand "
-             "rises before the target, ramps up fast, and ramps down slowly. With "
-             "--power-budget, sustained heat at 100%% fan also derates GPU power."
-    )
-    parser.add_argument(
-        "--power-budget",
-        type=float,
-        default=None,
-        metavar="WATTS",
-        help=f"Enable the power governor: cap GPU power limits so TOTAL UPS load stays "
-             f"under WATTS (e.g. --power-budget {DEFAULT_POWER_BUDGET:.0f}). Reads total "
-             f"draw from NUT. Off unless specified."
-    )
-    parser.add_argument(
-        "--ups",
-        default=DEFAULT_UPS_NAME,
-        help=f"NUT UPS name for the power governor (default: {DEFAULT_UPS_NAME}; see `upsc -l`)"
-    )
-    parser.add_argument(
-        "--power-interval",
-        type=float,
-        default=DEFAULT_POWER_INTERVAL,
-        help=f"Seconds between power-governor updates (default: {DEFAULT_POWER_INTERVAL}). "
-             f"The NUT driver only refreshes every ~2 s, so going below that buys nothing."
-    )
-    parser.add_argument(
-        "--power-fallback",
-        type=float,
-        default=DEFAULT_POWER_FALLBACK_W,
-        metavar="WATTS",
-        help=f"Per-GPU limit to clamp to if the UPS becomes unreadable "
-             f"(default: {DEFAULT_POWER_FALLBACK_W:.0f} W)"
-    )
-    parser.add_argument(
-        "--power-ceiling",
-        type=parse_power_ceiling,
-        default=None,
-        metavar="WATTS",
-        help="Upper power limit the governor will never exceed, replacing the card "
-             "hardware max (e.g. --power-ceiling 300). One value applies to every GPU; "
-             "a comma-separated list sets each GPU (--power-ceiling 300,400). Use "
-             "'none' to unpin. Enables the governor on its own — no UPS required — and "
-             "also bounds --power-fallback. Persisted to --power-ceiling-file so it "
-             "survives restarts and reboots"
-    )
-    parser.add_argument(
-        "--power-ceiling-file",
-        default=DEFAULT_POWER_CEILING_FILE,
-        metavar="PATH",
-        help=f"State/control file for the power ceiling (default: "
-             f"{DEFAULT_POWER_CEILING_FILE}). Read at startup to restore a ceiling after "
-             f"a reboot, and polled live so `echo 300 > PATH` pins and `echo none > PATH` "
-             f"unpins without restarting the service. SIGHUP re-reads immediately"
-    )
-    parser.add_argument(
-        "--no-power-ceiling-file",
-        action="store_true",
-        help="Do not read or write the ceiling state file; --power-ceiling then applies "
-             "to this run only and nothing is persisted"
-    )
-    parser.add_argument(
-        "--power-floor-on",
-        type=parse_power_floor_flags,
-        default=DEFAULT_POWER_FLOOR_FLAGS,
-        metavar="FLAG[,FLAG...]",
-        help="Comma-separated NUT ups.status flags that immediately clamp every GPU "
-             "to its hardware floor (default: OB,LB; use OB to ignore LB while online)"
-    )
-    parser.add_argument(
-        "--power-dry-run",
-        action="store_true",
-        help="Power governor logs what it WOULD set without touching the GPUs. "
-             "Use this first to sanity-check the budget against real load."
-    )
-    parser.add_argument(
-        "--mirror",
-        action="store_true",
-        help="No custom curve: keep the HOTTER card on its own factory (auto) curve, read "
-             "the fan it picks, and mirror it onto the cooler card. Overrides --mode/--independent."
-    )
+# ─────────────────────────── HAND-RUN ───────────────────────────
 
-    args = parser.parse_args()
+def acquire_daemon_lock(run_dir: str):
+    """Return an open, locked file if this process may drive the cards, else None."""
+    os.makedirs(run_dir, exist_ok=True)
+    fd = os.open(os.path.join(run_dir, LOCK_FILE), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        os.close(fd)
+        if e.errno in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
+            return None
+        raise
+    os.ftruncate(fd, 0)
+    os.write(fd, f"{os.getpid()}\n".encode())
+    return fd
 
-    curves = {
-        "native": NATIVE_CURVE,
-        "quiet": QUIET_CURVE,
-        "aggressive": AGGRESSIVE_FAN_CURVE,
-        "performance": PERFORMANCE_FAN_CURVE,
-        "max": MAX_COOLING_CURVE,
-    }
 
-    curve = curves[args.mode]
-    mode_desc = (f"TARGET {args.temp_target}C (manual sync)" if args.temp_target is not None
-                 else "MIRROR (hotter card's own curve, mirrored onto cooler)" if args.mirror
-                 else "INDEPENDENT (per-card)" if args.independent
-                 else "SYNC (all fans = hottest card)")
-    log.info(f"NVIDIA Fan Control - Curve: {args.mode.upper()} - {mode_desc}")
-    log.info("=" * 50)
+def daemon_running(run_dir: str) -> bool:
+    """True if another instance holds the daemon lock. Creates nothing."""
+    try:
+        fd = os.open(os.path.join(run_dir, LOCK_FILE), os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
 
-    # Resolve the startup ceiling. An explicit --power-ceiling wins over the persisted
-    # value and is written back, so the file always reflects what is actually in force.
-    # The unit deliberately does NOT pass --power-ceiling, which leaves the state file as
-    # the single source of truth and lets a live pin survive `systemctl restart`.
-    ceiling_path = None if args.no_power_ceiling_file else args.power_ceiling_file
-    persisted_ok, persisted_request = (read_ceiling_file(ceiling_path) if ceiling_path
-                                       else (False, None))
-    if args.power_ceiling is not None:
-        ceiling_request = args.power_ceiling or None     # [] means an explicit unpin
-        ceiling_source = "--power-ceiling"
-    else:
-        ceiling_request = persisted_request if persisted_ok else None
-        ceiling_source = f"persisted in {ceiling_path}"
 
-    # --power-budget is no longer the only enable switch: a ceiling runs the governor on
-    # its own with no UPS sensor, which also makes thermal derating available on hosts
-    # that have no NUT. An explicit `--power-ceiling none` starts it briefly so the unpin
-    # is applied and persisted.
-    governor = None
-    if (args.power_budget is not None or args.power_ceiling is not None
-            or ceiling_request is not None):
-        governor = PowerGovernor(
-            handles=[],                      # filled in by controller.init()
-            budget_w=args.power_budget,
-            ups_name=args.ups,
-            interval=args.power_interval,
-            fallback_w=args.power_fallback,
-            floor_on_flags=args.power_floor_on,
-            dry_run=args.power_dry_run,
-            ceiling_request=ceiling_request,
-            ceiling_path=ceiling_path,
-            persist_startup_ceiling=args.power_ceiling is not None,
-            ceiling_source=ceiling_source,
-        )
-        if args.power_budget is not None:
-            log.info(f"Power governor ENABLED — budget {args.power_budget:.0f} W via UPS "
-                     f"'{args.ups}', floor-on={','.join(args.power_floor_on)}")
+def lock_holder_pid(run_dir: str) -> Optional[int]:
+    try:
+        with open(os.path.join(run_dir, LOCK_FILE)) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def read_effective(run_dir: str) -> Optional[dict]:
+    try:
+        with open(os.path.join(run_dir, EFFECTIVE_FILE)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def clear_overrides(run_dir: str) -> List[str]:
+    removed = []
+    for name in SETTING_NAMES:
+        path = os.path.join(run_dir, SETTING_FILES[name])
+        try:
+            os.remove(path)
+            removed.append(SETTING_FILES[name])
+        except FileNotFoundError:
+            pass
+    return removed
+
+
+def signal_and_wait(run_dir: str, expect: Dict[str, str]) -> Tuple[bool, dict]:
+    """SIGHUP the running daemon and wait for effective.json to show `expect`."""
+    before = read_effective(run_dir) or {}
+    pid = lock_holder_pid(run_dir)
+    if pid is None:
+        return False, {"messages": ["could not find the running daemon's PID"]}
+    os.kill(pid, signal.SIGHUP)
+    deadline = time.monotonic() + OVERRIDE_ACK_TIMEOUT_S
+    while time.monotonic() < deadline:
+        time.sleep(0.5)
+        doc = read_effective(run_dir) or {}
+        if doc.get("generation", -1) == before.get("generation", -1):
+            continue
+        in_force = doc.get("in_force", {})
+        ok = all(in_force.get(k) == v for k, v in expect.items())
+        return ok, doc
+    return False, {"messages": [f"no acknowledgement from PID {pid} within "
+                                f"{OVERRIDE_ACK_TIMEOUT_S:.0f}s"]}
+
+
+def run_as_override(args, cli: Dict[str, object]) -> int:
+    """Another instance (normally the service) drives the cards: hand our settings to it
+    as a temporary override. Nothing saved is touched; a restart clears it."""
+    run_dir = args.run_dir
+    if args.clear_override:
+        if args.dry_run:
+            print("[dry-run] would remove the temporary overrides in " + run_dir)
+            return 0
+        try:
+            removed = clear_overrides(run_dir)
+        except OSError as e:
+            print(f"cannot clear overrides in {run_dir}: {e} (run as root)", file=sys.stderr)
+            return 3
+        ok, doc = signal_and_wait(run_dir, {})
+        print("Cleared temporary overrides: " + (", ".join(removed) or "none were set"))
+        return 0 if ok or not removed else 2
+    if not cli:
+        doc = read_effective(run_dir)
+        print(json.dumps(doc, indent=1) if doc else "The daemon is running; no state published yet.")
+        return 0
+    expect = {name: format_setting(name, value) for name, value in cli.items()}
+    if args.dry_run:
+        for name, text in expect.items():
+            print(f"[dry-run] would set a temporary override {SETTING_FILES[name]} = {text} "
+                  f"in {run_dir} (the running daemon keeps control; cleared on restart)")
+        return 0
+    previous: Dict[str, Optional[str]] = {}
+    try:
+        for name, text in expect.items():
+            path = os.path.join(run_dir, SETTING_FILES[name])
+            try:
+                with open(path) as f:
+                    previous[name] = f.read()
+            except FileNotFoundError:
+                previous[name] = None
+            _write_atomic(path, text + "\n")
+    except OSError as e:
+        print(f"cannot write the override in {run_dir}: {e} (run as root)", file=sys.stderr)
+        return 3
+    ok, doc = signal_and_wait(run_dir, expect)
+    if ok:
+        print("Temporary override applied by the running daemon (until it restarts): "
+              + ", ".join(f"{k}={v}" for k, v in expect.items()))
+        return 0
+    # Roll back, so a refused value can't linger in the override until the next restart.
+    for name, text in previous.items():
+        path = os.path.join(run_dir, SETTING_FILES[name])
+        if text is None:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
         else:
-            log.info("Power governor ENABLED in CEILING-ONLY mode — no UPS budget; "
-                     "power cap plus thermal derating only")
-    elif args.temp_target is not None:
-        log.warning("Temperature target has no --power-budget or --power-ceiling; fan "
-                    "control is active but thermal power derating is unavailable")
+            _write_atomic(path, text)
+    signal_and_wait(run_dir, {})
+    print("The running daemon did not take the override as given (rolled back):", file=sys.stderr)
+    for message in doc.get("messages", [])[-3:]:
+        print("  " + message, file=sys.stderr)
+    return 2
 
-    controller = NvidiaFanController(curve, args.interval,
-                                     sync=not args.independent, mirror=args.mirror,
-                                     governor=governor, temp_target=args.temp_target)
 
-    # Handle signals for clean shutdown
-    def signal_handler(sig, frame):
+# ─────────────────────────── MAIN ───────────────────────────
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="NVIDIA fan control and GPU power governor for headless hosts. Live "
+                    "settings come from the state dir; flags given by hand apply to this run "
+                    "only (or, if the service is running, become a temporary override).")
+    live = parser.add_argument_group("live settings (hand-run: this run only, never saved)")
+    live.add_argument("--mode", "-m", type=_argtype(parse_fan_profile), metavar="PROFILE",
+                      help="Fan profile: native (factory curve, hands off), quiet, aggressive, "
+                           "performance, max, or adaptive[:FANMAX] (hold the temp target, never "
+                           "louder than FANMAX%%, default 100)")
+    group = live.add_mutually_exclusive_group()
+    group.add_argument("--mirror", dest="mirror", action="store_const", const=True,
+                       help="Mirror on: both cards' fans follow the hotter card (back-to-back cards)")
+    group.add_argument("--independent", dest="mirror", action="store_const", const=False,
+                       help="Mirror off: each card follows its own temperature")
+    live.add_argument("--temp-target", type=_argtype(parse_temp_target), metavar="C",
+                      default=argparse.SUPPRESS,
+                      help="Temperature target in C, or 'none'. Power is cut at target+2C held for "
+                           "5s. Given without --mode, implies --mode adaptive (the old behaviour)")
+    live.add_argument("--power-ceiling", type=_argtype(parse_power_ceiling), metavar="WATTS",
+                      help="Per-GPU power ceiling: W, W,W, or 'none'")
+
+    safety = parser.add_argument_group("safety limits (set by the deployment)")
+    safety.add_argument("--temp-emergency", type=int, default=DEFAULT_TEMP_EMERGENCY_C, metavar="C",
+                        help=f"Emergency temperature: {EMERGENCY_DWELL_S:.0f}s at or above it cuts "
+                             f"every GPU to minimum power (default {DEFAULT_TEMP_EMERGENCY_C})")
+    safety.add_argument("--power-budget", type=float, metavar="WATTS",
+                        help="Keep TOTAL UPS load under WATTS (the UPS is a read-only input)")
+    safety.add_argument("--ups", default=DEFAULT_UPS_NAME,
+                        help=f"NUT UPS name (default {DEFAULT_UPS_NAME}; see `upsc -l`)")
+    safety.add_argument("--power-interval", type=float, default=DEFAULT_POWER_INTERVAL,
+                        help=f"Seconds between UPS reads (default {DEFAULT_POWER_INTERVAL})")
+    safety.add_argument("--power-fallback", type=float, default=DEFAULT_POWER_FALLBACK_W,
+                        metavar="WATTS", help="Per-GPU limit if the UPS becomes unreadable")
+    safety.add_argument("--power-floor-on", type=parse_power_floor_flags,
+                        default=DEFAULT_POWER_FLOOR_FLAGS, metavar="FLAG[,FLAG...]",
+                        help="NUT statuses that clamp every GPU to its floor (default OB,LB)")
+
+    run = parser.add_argument_group("running")
+    run.add_argument("--interval", "-i", type=float, default=2.0, help="Fan poll interval (s)")
+    run.add_argument("--once", action="store_true", help="One tick, then exit")
+    run.add_argument("--dry-run", "--power-dry-run", dest="dry_run", action="store_true",
+                     help="Log what would change (fans and power); touch nothing")
+    run.add_argument("--clear-override", action="store_true",
+                     help="Remove temporary overrides held by the running daemon")
+    run.add_argument("--reset-fans", action="store_true",
+                     help="Hand every fan back to its factory curve and exit. For the unit's "
+                          "ExecStopPost=: NVML does NOT revert manual fans when the daemon dies "
+                          "(measured 2026-09-29), so a crash would otherwise leave them stuck")
+    run.add_argument("--state-dir", default=DEFAULT_STATE_DIR,
+                     help=f"Saved settings + runtime state (default {DEFAULT_STATE_DIR})")
+    run.add_argument("--run-dir", default=DEFAULT_RUN_DIR,
+                     help=f"Overrides, lock, effective state (default {DEFAULT_RUN_DIR})")
+    return parser
+
+
+def cli_settings(args) -> Dict[str, object]:
+    cli: Dict[str, object] = {}
+    if args.mode is not None:
+        cli["profile"] = args.mode
+    if args.mirror is not None:
+        cli["mirror"] = args.mirror
+    if hasattr(args, "temp_target"):
+        cli["target"] = args.temp_target
+        if args.mode is None and args.temp_target is not None:
+            cli["profile"] = FanProfile("adaptive")     # legacy: --temp-target meant adaptive
+    if args.power_ceiling is not None:
+        cli["ceiling"] = args.power_ceiling or None
+    return cli
+
+
+def reset_fans() -> int:
+    """Put every fan on every GPU back on its factory curve. Safe to run any time."""
+    pynvml.nvmlInit()
+    failed = 0
+    for gpu in range(pynvml.nvmlDeviceGetCount()):
+        handle = pynvml.nvmlDeviceGetHandleByIndex(gpu)
+        for fan in range(pynvml.nvmlDeviceGetNumFans(handle)):
+            try:
+                pynvml.nvmlDeviceSetFanControlPolicy(
+                    handle, fan, pynvml.NVML_FAN_POLICY_TEMPERATURE_CONTINOUS_SW)
+            except pynvml.NVMLError as e:
+                failed += 1
+                log.error(f"GPU {gpu} Fan {fan}: could not reset: {e}")
+    pynvml.nvmlShutdown()
+    log.info("Fans handed back to the factory curve" + (f" ({failed} failed)" if failed else ""))
+    return 2 if failed else 0
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.reset_fans:
+        return reset_fans()
+    if not TEMP_EMERGENCY_MIN_C <= args.temp_emergency <= TEMP_EMERGENCY_MAX_C:
+        print(f"--temp-emergency must be {TEMP_EMERGENCY_MIN_C}..{TEMP_EMERGENCY_MAX_C}", file=sys.stderr)
+        return 3
+    cli = cli_settings(args)
+
+    if args.dry_run:
+        # A dry run drives nothing, so it takes no lock and creates no files.
+        if daemon_running(args.run_dir):
+            return run_as_override(args, cli)
+        if args.clear_override:
+            print("No daemon is running, so there are no temporary overrides to clear.")
+            return 0
+    else:
+        try:
+            lock = acquire_daemon_lock(args.run_dir)
+        except OSError as e:
+            print(f"cannot use {args.run_dir}: {e} (run as root, or pass --run-dir)", file=sys.stderr)
+            return 3
+        if lock is None:
+            return run_as_override(args, cli)
+        if args.clear_override:
+            print("No daemon is running, so there are no temporary overrides to clear.")
+            return 0
+        # We drive the cards. A fresh controlling instance starts with no overrides:
+        # that is what makes a service restart reset them.
+        stale = clear_overrides(args.run_dir)
+        if stale:
+            log.info("Cleared stale temporary overrides: " + ", ".join(stale))
+
+    log.info("NVIDIA fan control + GPU power governor")
+    log.info("=" * 50)
+    store = SettingsStore(args.state_dir, args.run_dir, cli)
+    governor = PowerGovernor(handles=[], budget_w=args.power_budget, ups_name=args.ups,
+                             interval=args.power_interval, fallback_w=args.power_fallback,
+                             floor_on_flags=args.power_floor_on, dry_run=args.dry_run)
+    controller = FanController(store, governor, poll_interval=args.interval,
+                               emergency_c=args.temp_emergency, state_dir=args.state_dir,
+                               run_dir=args.run_dir, dry_run=args.dry_run)
+
+    def on_stop(sig, frame):
         log.info(f"Received signal {sig}")
         controller.stop()
 
-    def reload_handler(sig, frame):
-        log.info("Received SIGHUP — re-reading the power ceiling control file")
-        if governor:
-            governor.request_reload()
+    def on_reload(sig, frame):
+        log.info("Received SIGHUP — re-reading settings")
+        store.request_reload()
 
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGHUP, reload_handler)
+    signal.signal(signal.SIGTERM, on_stop)
+    signal.signal(signal.SIGINT, on_stop)
+    signal.signal(signal.SIGHUP, on_reload)
 
     controller.init()
-
     if args.once:
-        if args.temp_target is not None:
-            controller.update_fans_target()
-        elif args.mirror:
-            controller.update_fans_mirror()
-        else:
-            controller.update_fans()
-        if governor:
-            governor.update(force=True)
-        log.info("Ran once. Fans will return to auto control after a few minutes.")
-    else:
-        controller.run()
+        controller.update()
+        governor.update(force=True)
+        log.info("Ran once.")
+        return 0
+    controller.run()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
