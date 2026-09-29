@@ -234,5 +234,5 @@ Only then put `--power-budget` in the unit.
 |---|---|
 | `nvidia-fan-control.py` | the daemon (single file, stdlib + pynvml) |
 | `nvidia-fan-control.service` | **reference** unit — dev-box paths, adapt for the fleet |
-| `stress_vllm.py` | load generator used to exercise the fan curve |
+| *(load testing)* | `gpu-burn` (built for sm_120) in the `gpu-test` container, driven by `/root/ceiling-load-test.sh` on pve-ai; both are the deploy team's |
 | `README.md` | user-facing docs incl. control law and anti-oscillation values |
