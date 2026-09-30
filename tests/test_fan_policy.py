@@ -1104,6 +1104,51 @@ ctl, gov, *_ = rig(saved={"ceiling": "600"}, budget=900, now=300.0)
 check("without a total, a restart still starts from the current limits (unchanged)",
       gov.cap_w == [300.0, 300.0], gov.cap_w)
 
+print("\n== deploy-team review of plan 003 ==")
+# effective.json follows the governor, not just settings changes
+ctl, gov, *_ = rig(saved={"ceiling": "600", "total": "700"})
+busy_cards(False, False)
+run(ctl, 2, total=700.0)
+ctl.refresh_effective()
+busy_cards(False, True)
+run(ctl, 8, total=700.0)
+ctl.refresh_effective()
+doc = json.load(open(os.path.join(ctl.run_dir, "effective.json")))
+check("effective.json shows the limits and shares in force after the split moved (150/550)",
+      doc["power_limits_w"] == [150, 550] and doc["total_shares_w"] == [150, 550],
+      (doc["power_limits_w"], doc["total_shares_w"]))
+
+# (1) a lowering that fails must hold every raise
+ctl, gov, *_ = rig(saved={"ceiling": "600", "total": "700"})
+busy_cards(True, True)
+run(ctl, 3, total=700.0)
+check("both busy: 350 / 350", limits() == [350.0, 350.0], limits())
+busy_cards(False, True)
+nv.DEVS[0].set_fail = 3                      # GPU0's next three limit writes fail
+trace = []
+ok = run(ctl, 10, total=700.0, trace=trace)
+check("GPU0's lowering fails 3 times: GPU1 is not raised meanwhile, the sum never over 700",
+      ok, trace)
+run(ctl, 3, total=700.0)
+check("...GPU0 lowered on a retry, then GPU1 raised: 150 / 550", limits() == [150.0, 550.0],
+      limits())
+
+# (3) after a restart with a UPS budget, full shares only once the first UPS reading is fine
+ctl, gov, *_ = rig(saved={"ceiling": "600", "total": "700"}, budget=900, now=300.0)
+check("restart: shares not raised before the first UPS reading", max(limits()) <= 300.0, limits())
+gov.ups.read = lambda: (400.0, ("OB", "DISCHRG"))
+busy_cards(True, True)
+nv.SET_CALLS.clear()
+run(ctl, 4, total=700.0)
+check("first UPS reading on battery: straight to the floor (150), never a write above 300 first",
+      limits() == [150.0, 150.0] and all(w <= 300.0 for _, w in nv.SET_CALLS),
+      (limits(), nv.SET_CALLS))
+ctl, gov, *_ = rig(saved={"ceiling": "600", "total": "700"}, budget=900, now=300.0)
+gov.ups.read = lambda: (400.0, ("OL",))
+busy_cards(True, True)
+run(ctl, 4, total=700.0)
+check("first UPS reading fine: full shares (350 / 350)", limits() == [350.0, 350.0], limits())
+
 print("\n== unequal per-GPU ceilings no longer collapse on a cut (the shared-cap bug) ==")
 ctl, gov, *_ = rig(saved={"profile": "quiet", "ceiling": "600,300", "target": "80"})
 set_temp(81, 50)

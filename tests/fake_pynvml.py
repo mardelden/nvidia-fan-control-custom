@@ -38,6 +38,7 @@ class _Dev:
         self.policy = NVML_FAN_POLICY_TEMPERATURE_CONTINOUS_SW
         self.manual_fan = 30
         self.temp_fail = False
+        self.set_fail = 0             # fail the next N power-limit writes
 
     @property
     def fan(self):
@@ -91,6 +92,9 @@ def nvmlDeviceGetPowerManagementLimit(h): return h.limit * 1000
 
 
 def nvmlDeviceSetPowerManagementLimit(h, mw):
+    if getattr(h, "set_fail", 0):
+        h.set_fail -= 1
+        raise NVMLError("set power limit failed")
     h.limit = max(h.lo, min(h.hi, mw / 1000.0))
     SET_CALLS.append((h.i, h.limit))
 

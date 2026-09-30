@@ -263,6 +263,7 @@ LOCK_FILE = "daemon.lock"
 RUNTIME_SAVE_INTERVAL_S = 60.0
 HOLD_RESTORE_MAX_AGE_S = 300.0
 OVERRIDE_ACK_TIMEOUT_S = 15.0
+EFFECTIVE_REFRESH_S = 10.0      # effective.json: at least this fresh (temps, fans)
 
 
 # ─────────────────────────── PARSERS ───────────────────────────
@@ -680,6 +681,8 @@ class PowerGovernor:
         self._last_busy_at: List[float] = []
         self._last_temps: Optional[Dict[int, int]] = None
         self._fan_threshold: Optional[int] = None      # set while adaptive drives the fans
+        self._settle_pending = False    # full shares after a restart, once the UPS reads fine
+        self._settle_now = False
         self._card_recent: Dict[int, List[int]] = {}   # per card: last 3 readings, oldest first
         self._hold_log_pending = True
 
@@ -1110,9 +1113,15 @@ class PowerGovernor:
         if (self.total_w is None or not self.cap_w or self._holding()
                 or self._was_power_floor):
             return
+        if self.budget_w is not None and not self._settle_now:
+            self._settle_pending = True     # after the first UPS reading (deploy-team review)
+            return
+        self._settle_pending = False
         self.cap_w = [self._ceil_w(i) for i in range(len(self.handles))]
         for i in range(len(self.handles)):
             self._set_limit(i, self._limit_for(i))
+        log.info("POWER: started with a total: every card at its full share "
+                 + "/".join(f"{w:.0f}" for w in self.applied_w) + "W")
 
     def _share_high(self, i: int) -> float:
         """The most card i can take: its own ceiling, and below that its cap (a thermal or
@@ -1207,12 +1216,22 @@ class PowerGovernor:
             raising = []
         else:
             new = want
-        if self.alloc_w is not None and not lowering and not raising:
+        stuck = [i for i in range(n) if self.alloc_w is not None
+                 and self.applied_w[i] > self.max_w[i] + 0.5]
+        if self.alloc_w is not None and not lowering and not raising and not stuck:
             return
         self.alloc_w = new
         self._recompute_max_w()
-        for i in lowering:
+        for i in set(lowering) | set(stuck):
             self._lower_to(i, self.max_w[i])
+        # a lowering that didn't take (an NVML write error) leaves a card above its share:
+        # no card is raised until every card is within its share, or the sum could exceed
+        # the total (deploy-team review of plan 003)
+        stuck = [i for i in range(n) if self.applied_w[i] > self.max_w[i] + 0.5]
+        if stuck:
+            log.warning("⚠ POWER: GPU " + ",".join(str(i) for i in stuck) + " still above its "
+                        "share of the total (a limit write failed); raises held until it's down")
+            raising = []
         if raising and not (self.emergency_active or self.blind_active or self._was_power_floor):
             for i in raising:
                 if self.cap_w:
@@ -1479,6 +1498,7 @@ class PowerGovernor:
         matched_floor_flags = [flag for flag in self.floor_on_flags if flag in status_flags]
 
         if matched_floor_flags:
+            self._settle_pending = False        # on battery at start: no full shares
             if not self._was_power_floor:
                 status = " ".join(status_flags) or "(empty)"
                 matched = ",".join(matched_floor_flags)
@@ -1514,6 +1534,18 @@ class PowerGovernor:
                 log.warning(f"⚠ POWER: no fresh UPS feedback for {elapsed:.0f}s; "
                             "allowing another decision")
                 self._feedback_wait_total_w = None
+
+        if self._settle_pending:
+            # first UPS reading after a restart: no on-battery floor (handled above) and not
+            # over budget, so the cards can take their full shares
+            self._settle_pending = False
+            if total_w <= self.budget_w and not self._holding():
+                self._settle_now = True
+                self.settle_after_start()
+                self._settle_now = False
+            else:
+                log.info(f"POWER: first UPS reading {total_w:.0f} W is over the "
+                         f"{self.budget_w:.0f} W budget: the cards walk up to their shares instead")
 
         gpu_state = self._read_gpu_power_and_activity()
         if gpu_state is None:
@@ -1732,6 +1764,8 @@ class FanController:
         self.last_temps: Dict[int, int] = {}
         self.messages: List[str] = []
         self._written_generation = -1
+        self._written_snapshot: Optional[tuple] = None
+        self._written_at = 0.0
         self._read_history: List[bool] = []     # True = a card was unreadable (blind window)
         self._blind_reported = False
         # set here, not in run(): a stop requested during init() must be honoured (#6)
@@ -2201,8 +2235,24 @@ class FanController:
             os.makedirs(self.run_dir, exist_ok=True)
             _write_atomic(os.path.join(self.run_dir, EFFECTIVE_FILE), json.dumps(doc, indent=1) + "\n")
             self._written_generation = self.store.generation
+            self._written_snapshot = self._power_snapshot()
+            self._written_at = time.monotonic()
         except OSError as e:
             log.warning(f"⚠ could not write {EFFECTIVE_FILE}: {e}")
+
+    def _power_snapshot(self) -> tuple:
+        g = self.governor
+        return (tuple(round(w) for w in g.applied_w),
+                tuple(round(w) for w in g.alloc_w) if g.alloc_w is not None else None,
+                g.thermal_limited, g.emergency_active, g.blind_active, g.recovery_walk)
+
+    def refresh_effective(self):
+        """effective.json was rewritten only on a settings change, so the limits and shares
+        in it went stale as soon as the governor moved them (deploy-team review): rewrite it
+        when they change, and every EFFECTIVE_REFRESH_S for temperatures and fans."""
+        if (self._power_snapshot() != self._written_snapshot
+                or time.monotonic() - self._written_at >= EFFECTIVE_REFRESH_S):
+            self._write_effective()
 
     # ── lifecycle ──
     def restore_auto_control(self):
@@ -2224,6 +2274,7 @@ class FanController:
             while self.running:
                 self.update()
                 self.governor.update()
+                self.refresh_effective()
                 self.save_runtime_state()
                 time.sleep(self.poll_interval)
         except KeyboardInterrupt:
