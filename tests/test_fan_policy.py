@@ -504,7 +504,8 @@ tick(ctl, 40)
 learned = ctl._target_trim_pct
 ctl.save_runtime_state(force=True)
 doc = json.load(open(os.path.join(state, nfc.RUNTIME_STATE_FILE)))
-check("trim saved with its target", doc["adaptive"] == {"target_c": 80, "trim_pct": round(learned, 2)},
+check("trim saved with its target (and the unlearning floor)",
+      doc["adaptive"] == {"target_c": 80, "trim_pct": round(learned, 2), "trim_floor_pct": -50.0},
       doc)
 store2 = nfc.SettingsStore(state, run, {})
 gov2 = nfc.PowerGovernor(handles=[], interval=5.0)
@@ -1048,6 +1049,46 @@ check("no step while the card keeps warming (40 s of climbing)", climbing_steps 
 set_temp(58, 45)
 run(ctl, 20)
 check("settled (58C, below the target): the walk resumes", gov.cap_w[0] > before, (before, gov.cap_w))
+
+print("\n== adaptive unlearns: each power cut for heat raises the quiet-trim floor ==")
+# pve-ai 2026-09-29 under vLLM: a -35% trim parked GPU1 at 83C with the fans at 58%, and each
+# burst became a 230-240 W cut. Operator: unlearn from the cuts (no fan-target offset).
+ctl, gov, *_ = rig(saved={"profile": "adaptive:90", "ceiling": "600", "total": "700", "target": "85"})
+busy_cards(True, False)
+set_temp(83, 45)
+run(ctl, 200)                                # a steady load just under the target: learns quiet
+check("steady just under the target: adaptive learns a deep quiet trim (floor -50)",
+      ctl._target_trim_pct < -20.0 and ctl._trim_floor_pct == -50.0,
+      (ctl._target_trim_pct, ctl._trim_floor_pct))
+
+def burst(ctl):
+    """a load step: the card jumps over the target (a cut), then cools and recovers"""
+    set_temp(86, 45); run(ctl, 1)
+    set_temp(89, 45); run(ctl, 4)
+    set_temp(80, 45); run(ctl, 10)
+
+burst(ctl)
+check("first cut: the floor rises -50 -> -30", ctl._trim_floor_pct == -30.0 and gov.thermal_holds == 1,
+      (ctl._trim_floor_pct, gov.thermal_holds))
+burst(ctl)
+burst(ctl)
+check("two more cuts: -30 -> -10 -> 0 (the base curve)", ctl._trim_floor_pct == 0.0,
+      ctl._trim_floor_pct)
+set_temp(83, 45)
+run(ctl, 150)                                # recovered, steady again just under the target
+check("at floor 0 no quiet trim is learned: the fans follow the base curve (90% at 83C)",
+      ctl._target_trim_pct == 0.0 and fans() == [90, 90], (ctl._target_trim_pct, fans()))
+CLOCK.advance(nfc.TRIM_FLOOR_RELAX_S)
+run(ctl, 1)
+check("10 cut-free minutes: the floor relaxes 0 -> -5", ctl._trim_floor_pct == -5.0,
+      ctl._trim_floor_pct)
+ctl.save_runtime_state(force=True)
+doc = json.load(open(os.path.join(ctl.state_dir, nfc.RUNTIME_STATE_FILE)))
+check("the floor is saved with the trim", doc["adaptive"]["trim_floor_pct"] == -5.0, doc["adaptive"])
+ctl._write_effective()
+doc = json.load(open(os.path.join(ctl.run_dir, "effective.json")))
+check("...and published in effective.json", doc["adaptive_trim_floor_pct"] == -5.0,
+      doc.get("adaptive_trim_floor_pct"))
 
 print("\n== recovery per card: a cool card comes back fast while the other sits near the target ==")
 ctl, gov, *_ = rig(saved={"profile": "quiet", "ceiling": "600", "target": "60"}, budget=900)

@@ -111,6 +111,15 @@ TARGET_TRACKING_BAND_C = 8
 TARGET_TRIM_MIN_PCT = -50.0
 TARGET_TRIM_DOWN_PCT_PER_C_S = 0.125
 TARGET_TRIM_UP_PCT_PER_C_S = 2.5
+# Unlearning (operator, 2026-09-29): adaptive learns from its own power cuts. Each thermal hold
+# (a power cut for heat) raises a floor under the quiet trim by TRIM_FLOOR_RAISE_PCT, so a
+# bursty workload that keeps getting cut ends up on the base curve (fans ahead of the burst);
+# every TRIM_FLOOR_RELAX_S without a cut lowers it again by TRIM_FLOOR_RELAX_PCT, so a steady
+# workload drifts back to quiet. Seen on pve-ai under vLLM: a -35% trim parked GPU1 at 83 C
+# with fans at 58%, and each burst became a 230-240 W cut.
+TRIM_FLOOR_RAISE_PCT = 20.0
+TRIM_FLOOR_RELAX_PCT = 5.0
+TRIM_FLOOR_RELAX_S = 600.0
 ADAPTIVE_FAN_MAX_MIN_PCT = TARGET_FAN_MIN_PCT   # a fan max below the floor is contradictory
 DEFAULT_ADAPTIVE_FAN_MAX_PCT = 100
 
@@ -674,6 +683,7 @@ class PowerGovernor:
         self._target_c: Optional[int] = None
         self._conservative_recovery = False     # after an emergency: +20 W steps only
         self.thermal_limited = False
+        self.thermal_holds = 0          # holds started (power cuts for heat), for adaptive
         # temperature unreadable
         self.blind_active = False
         self._blind_ok_since: Optional[float] = None
@@ -1429,6 +1439,8 @@ class PowerGovernor:
                 cut = min(step_w, THERMAL_POWER_MAX_STEP_FRACTION * levels[i])
                 self.cap_w[i] = max(self.min_w[i], levels[i] - max(THERMAL_POWER_MIN_STEP_W, cut))
                 self._lower_to(i, self._limit_for(i))
+            if not self.thermal_limited:
+                self.thermal_holds += 1     # a new hold: adaptive's unlearning counts these
             self.thermal_limited = True
             self.recovery_walk = False
             self._thermal_hot_since = now
@@ -1817,6 +1829,9 @@ class FanController:
         self._commanded_fan_pct: Optional[int] = None     # adaptive (one zone)
         self._target_trim_pct = 0.0
         self._pending_trim: Optional[Tuple[int, float]] = None
+        self._trim_floor_pct = TARGET_TRIM_MIN_PCT      # unlearning: raised by power cuts
+        self._seen_holds = 0
+        self._floor_changed_at = time.monotonic()
         self.last_fan_pct: Optional[int] = None
         self.last_temps: Dict[int, int] = {}
         self.messages: List[str] = []
@@ -2144,9 +2159,34 @@ class FanController:
         ratio = (temp - approach_start) / TARGET_FAN_APPROACH_BAND_C
         return max(TARGET_FAN_MIN_PCT, min(100, round(TARGET_FAN_MIN_PCT + ratio * (100 - TARGET_FAN_MIN_PCT))))
 
+    def _unlearn(self):
+        """Adaptive learns from its own power cuts: each new thermal hold raises the floor
+        under the quiet trim; a cut-free TRIM_FLOOR_RELAX_S lowers it again."""
+        now = time.monotonic()
+        holds = self.governor.thermal_holds
+        if holds > self._seen_holds:
+            before = self._trim_floor_pct
+            self._trim_floor_pct = min(0.0, self._trim_floor_pct
+                                       + TRIM_FLOOR_RAISE_PCT * (holds - self._seen_holds))
+            self._seen_holds = holds
+            self._floor_changed_at = now
+            log.info(f"FAN: adaptive unlearns after a power cut for heat: quiet trim floor "
+                     f"{before:+.0f}% -> {self._trim_floor_pct:+.0f}%"
+                     + (" (the fans now follow the base curve)"
+                        if self._trim_floor_pct >= 0.0 else ""))
+        elif (self._trim_floor_pct > TARGET_TRIM_MIN_PCT
+              and now - self._floor_changed_at >= TRIM_FLOOR_RELAX_S):
+            before = self._trim_floor_pct
+            self._trim_floor_pct = max(TARGET_TRIM_MIN_PCT,
+                                       self._trim_floor_pct - TRIM_FLOOR_RELAX_PCT)
+            self._floor_changed_at = now
+            log.info(f"FAN: adaptive, {TRIM_FLOOR_RELAX_S / 60:.0f} min without a power cut: "
+                     f"quiet trim floor {before:+.0f}% -> {self._trim_floor_pct:+.0f}%")
+
     def _update_adaptive(self, hottest: int) -> int:
         """The learning controller: hold the card AT the target, never above the fan max.
         Both cards are one thermal zone (v1)."""
+        self._unlearn()
         fan_max = self.profile.fan_max
         base = self.get_target_fan_demand(hottest)
         if self._commanded_fan_pct is None:
@@ -2174,7 +2214,7 @@ class FanController:
             elif error_c > 0:
                 self._target_trim_pct += (error_c * TARGET_TRIM_UP_PCT_PER_C_S
                                           * self.poll_interval)
-            self._target_trim_pct = max(TARGET_TRIM_MIN_PCT, min(0.0, self._target_trim_pct))
+            self._target_trim_pct = max(self._trim_floor_pct, min(0.0, self._target_trim_pct))
             demand = round(max(TARGET_FAN_MIN_PCT, min(fan_max, base + self._target_trim_pct)))
 
         emergency = hottest >= self.emergency_c
@@ -2189,7 +2229,8 @@ class FanController:
         for gpu in range(len(self.handles)):
             self._set_speed(gpu, command)
         log.info(f"target: hottest={hottest}C target={self.target}C "
-                 f"base={base}% trim={self._target_trim_pct:+.1f}% demand={demand}% "
+                 f"base={base}% trim={self._target_trim_pct:+.1f}% "
+                 f"(floor {self._trim_floor_pct:+.0f}%) demand={demand}% "
                  f"command={command}% max={fan_max}%" + (" EMERGENCY" if emergency else "")
                  + ({"hold": " HOLD: no quiet trim", "recovering": " RECOVERING: no quiet trim"}
                     .get(heat, "") if not emergency else ""))
@@ -2224,7 +2265,11 @@ class FanController:
         if adaptive.get("target_c") is not None and adaptive.get("trim_pct") is not None:
             trim = (int(adaptive["target_c"]), float(adaptive["trim_pct"]))
             if self.profile.name == "adaptive" and self.target == trim[0]:
-                self._target_trim_pct = max(TARGET_TRIM_MIN_PCT, min(0.0, trim[1]))
+                floor = adaptive.get("trim_floor_pct")
+                if floor is not None:
+                    self._trim_floor_pct = max(TARGET_TRIM_MIN_PCT, min(0.0, float(floor)))
+                    self._floor_changed_at = time.monotonic()
+                self._target_trim_pct = max(self._trim_floor_pct, min(0.0, trim[1]))
                 log.info(f"FAN: adaptive trim restored from runtime state "
                          f"({self._target_trim_pct:+.1f}% for {trim[0]}C)")
             else:
@@ -2242,7 +2287,8 @@ class FanController:
         if self.dry_run or (not force and now - self._last_runtime_save < RUNTIME_SAVE_INTERVAL_S):
             return
         self._last_runtime_save = now
-        adaptive = ({"target_c": self.target, "trim_pct": round(self._target_trim_pct, 2)}
+        adaptive = ({"target_c": self.target, "trim_pct": round(self._target_trim_pct, 2),
+                     "trim_floor_pct": round(self._trim_floor_pct, 1)}
                     if self.profile.name == "adaptive" and self.target is not None
                     else ({"target_c": self._pending_trim[0], "trim_pct": self._pending_trim[1]}
                           if self._pending_trim else None))
@@ -2284,6 +2330,8 @@ class FanController:
                                if self.governor.alloc_w is not None else None),
             "temps_c": [self.last_temps.get(g) for g in range(len(self.handles))],
             "fan_pct": self.last_fan_pct,
+            "adaptive_trim_floor_pct": (round(self._trim_floor_pct, 1)
+                                        if self.profile.name == "adaptive" else None),
             "adaptive_trim_pct": (round(self._target_trim_pct, 1)
                                   if self.profile.name == "adaptive" else None),
             "messages": self.messages,

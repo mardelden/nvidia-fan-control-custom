@@ -55,6 +55,13 @@ trim that pulls the fans down to the quietest speed that still holds the target.
 learns downward slowly, holds at the target, and unwinds fast if the card gets hotter. What
 it has learned survives a restart.
 
+**It also unlearns.** Parked at the target with quiet fans, a bursty load, such as vLLM, turns
+every burst into a power cut. So each power cut for heat raises a **floor under the trim** by
+20% (−50 → −30 → −10 → 0). A workload that keeps getting cut ends up with the fans on the
+base curve, ahead of the burst. Every 10 minutes without a cut lowers the floor by 5%, so a
+steady workload drifts back to quiet. The floor survives a restart and shows in
+`effective.json` as `adaptive_trim_floor_pct`.
+
 **Mirror** is for cards that share airflow (back to back): both fans follow the **hotter**
 card. With `native`, the hotter card stays on its factory curve and the cooler card copies
 its speed. With a fixed curve, both cards run the curve at the hotter card's temperature.
