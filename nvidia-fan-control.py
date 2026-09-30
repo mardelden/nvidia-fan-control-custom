@@ -165,6 +165,13 @@ THERMAL_POWER_SKIP_DWELL_EXCESS_C = 4 # target+4 C or more: no grace
 THERMAL_RATE_FAST_C_PER_READING = 2
 THERMAL_RATE_LOOKAHEAD_READINGS = 2
 THERMAL_RATE_WINDOW_C = 10
+# Prediction, smoothed and bounded (operator, 2026-09-30, from production under vLLM): one
+# +4 C reading at 83 C predicted 91-96 C and halved the power (-202 W, -288 W). Now it takes
+# two rising readings in a row, their average rise, and only while the card is still below
+# the cut point; the prediction can add at most THERMAL_PREDICT_MAX_EXCESS_C (a cut of at
+# most 30 W x 2^2 = 120 W). Once the card is measured over the target, the measured excess
+# alone sizes the cut: the large cuts are for real overshoot.
+THERMAL_PREDICT_MAX_EXCESS_C = 2
 # The target must leave room below the emergency temperature, so the normal cut always
 # comes first. Independent of the margin above.
 TEMP_TARGET_EMERGENCY_GAP_C = 3
@@ -1404,14 +1411,21 @@ class PowerGovernor:
 
         trigger_c = target_c + THERMAL_POWER_MARGIN_C
         fans_ok = fan_threshold is None or (fan_pct is not None and fan_pct >= fan_threshold)
-        # rate of rise: only at the onset (not already holding), only when clearly fast
+        # rate of rise: only at the onset (not already holding), only while the card is
+        # still below the cut point, and only on a sustained rise (two rising readings in a
+        # row, averaged), so a single jump doesn't extrapolate into a big cut
         predicted_c = None
-        if (not self.thermal_limited
-                and rise_c >= THERMAL_RATE_FAST_C_PER_READING
+        recent = self._recent_c
+        sustained = (len(recent) >= 3 and recent[-1] > recent[-2] > recent[-3])
+        avg_rise_c = (recent[-1] - recent[-3]) / 2.0 if len(recent) >= 3 else 0.0
+        if (not self.thermal_limited and sustained and hottest_c < trigger_c
+                and avg_rise_c >= THERMAL_RATE_FAST_C_PER_READING
                 and hottest_c >= trigger_c - THERMAL_RATE_WINDOW_C):
-            predicted_c = hottest_c + rise_c * THERMAL_RATE_LOOKAHEAD_READINGS
+            predicted_c = hottest_c + int(round(avg_rise_c * THERMAL_RATE_LOOKAHEAD_READINGS))
         predictive = predicted_c is not None and predicted_c >= trigger_c
-        effective_c = max(hottest_c, predicted_c) if predictive else hottest_c
+        # bounded: a prediction adds at most THERMAL_PREDICT_MAX_EXCESS_C beyond the target
+        effective_c = (min(predicted_c, trigger_c + THERMAL_PREDICT_MAX_EXCESS_C) if predictive
+                       else hottest_c)
         thermally_over = effective_c >= trigger_c and fans_ok
 
         if thermally_over:
@@ -1461,7 +1475,8 @@ class PowerGovernor:
                 self._feedback_wait_status_flags = status_flags
                 self._feedback_wait_since = now
             fans = f" at {fan_pct}% fan" if fan_pct is not None else ""
-            why = (f"rising {rise_c}C/reading, predicted {predicted_c}C"
+            why = (f"rising {avg_rise_c:.1f}C/reading over 2 readings, predicted {predicted_c}C "
+                   f"(cut sized for at most +{THERMAL_PREDICT_MAX_EXCESS_C}C)"
                    if predictive and predicted_c > hottest_c
                    else "still climbing, no grace" if climbing and hot_for < 1.0
                    else f"for {hot_for:.0f}s")

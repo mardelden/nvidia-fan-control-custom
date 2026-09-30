@@ -82,9 +82,13 @@ its speed. With a fixed curve, both cards run the curve at the hotter card's tem
 - **Grace:** a card that's **steady** at the target gets 5 s before the first cut, so a brief
   touch isn't punished. A card that's **still climbing** (warmer than two readings ago) is cut
   at once, and at +4 °C or more there's never a grace.
-- **Prediction:** if a card rises **≥ 2 °C in one reading** while within 10 °C of the target,
-  the daemon projects two readings ahead and cuts **before** the target, sized by the predicted
-  overshoot. On pve-ai this took the peak from 82 °C to exactly the 75 °C target.
+- **Prediction, smoothed and bounded:** if a card rises in **two readings in a row**, averaging
+  **≥ 2 °C per reading**, while it's still below the target and within 10 °C of it, the daemon
+  projects two readings ahead and cuts **before** the target. The cut assumes at most **+2 °C**
+  of overshoot (≤ 120 W). Once the card is measured over the target, the **measured** excess
+  alone sizes the cut, so the large cuts are for real overshoot. (First version: one reading
+  and sized by the full prediction. Under vLLM a single +4 °C reading halved the power twice;
+  changed 2026-09-30.)
 - **Hold while falling:** after a cut, no further cut while the card is still cooling. It's cut
   again only if it stops falling while still at or over the target.
 - **Release and recovery:** with a fixed curve the hold is released at `target − 2 °C` for

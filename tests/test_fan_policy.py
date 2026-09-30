@@ -315,18 +315,31 @@ def rise(temps, target=75, profile="quiet", **kw):
         ctl.update()
         CLOCK.advance(2.0)
     return ctl, gov
-ctl, gov = rise([64, 70])          # 3 C/s: predicted 70 + 12 = 82 >= 75
-check("fast rise (3 C/s): cut at 70C, BEFORE the 75C target, no grace", limits()[0] < 600.0, limits())
-check("...sized by the predicted overshoot (+7C -> 50%): 300 W", limits()[0] == 300.0, limits())
+# smoothed and bounded (operator, 2026-09-30): production under vLLM saw one +4C reading at 83C
+# predict 91-96C and halve the power
+ctl, gov = rise([64, 70])          # ONE fast reading
+check("one fast reading (64 -> 70) no longer predicts: no cut below the target",
+      limits()[0] == 600.0, limits())
+ctl, gov = rise([58, 64, 70])      # two rising readings, +6C/reading: predicted 82 >= 75
+check("a sustained fast rise (58 -> 64 -> 70): cut BEFORE the 75C target, no grace",
+      limits()[0] < 600.0, limits())
+check("...bounded: sized for at most +2C (-120 W), not the predicted +7C (50%)",
+      limits()[0] == 480.0, limits())
 ctl, gov = rise([70, 71, 72, 73, 74])   # 0.5 C/s
 check("slow climb (0.5 C/s): no prediction, nothing below the target", limits()[0] == 600.0, limits())
 ctl, gov = rise([74, 73, 74, 73, 74])   # flicker
 check("1 C flicker at 74C: no prediction, no cut", limits()[0] == 600.0, limits())
-ctl, gov = rise([50, 60])          # 5 C/s but 15 C below target
+ctl, gov = rise([50, 55, 60])      # fast, but 15C below the target
 check("fast rise more than 10C below the target: ignored", limits()[0] == 600.0, limits())
-ctl, gov = rise([64, 70, 76])      # predictive cut at 70 (reference 82), then 76
-check("after a predictive cut, 76C (below the predicted 82C) is HELD, not cut again",
-      limits()[0] == 300.0, limits())
+ctl, gov = rise([58, 64, 70, 76])  # predictive cut at 70, then 76 two seconds later
+check("after a predictive cut, 76C is held for the repeat dwell, not cut again at once",
+      limits()[0] == 480.0, limits())
+ctl, gov = rise([76, 80, 84], target=85)   # production replay (vLLM): +4C/reading after a recovery
+check("production replay: +4C/reading toward 85C -> one bounded cut at 84C (-120 W), not half "
+      "the power", limits()[0] == 480.0, limits())
+ctl, gov = rise([70, 74, 78])      # already over the target: measured, not predicted
+check("a card measured over the target is cut by its MEASURED excess (+3C: -240 W), not a "
+      "prediction", limits()[0] == 360.0, limits())
 ctl, gov = rise([60, 66, 72], target=75, profile="adaptive:60")   # fans climb 10%/tick, not yet at 60
 check("adaptive: prediction alone doesn't cut while the fans are below the fan max",
       limits()[0] == 600.0 or max(fans()) >= 60, (limits(), fans()))
@@ -338,9 +351,12 @@ ctl.update(); CLOCK.advance(2.0); ctl.update(); CLOCK.advance(2.0); ctl.update()
 check("steady AT the target keeps the 5 s grace (no cut at 4 s)", limits()[0] == 600.0, limits())
 CLOCK.advance(2.0); ctl.update()
 check("...and is cut once the grace runs out (-30 W)", limits()[0] == 570.0, limits())
-ctl, gov = rise([66, 67, 69, 70, 72])       # the real cold run: +2 C at 70 -> 72
-check("cold-run replay: +2C in one reading at 72C predicts 76C -> cut BEFORE the 75C target",
-      limits()[0] == 540.0, limits())
+ctl, gov = rise([66, 67, 69, 70, 72])       # the real cold run: +1, then +2 per reading
+check("cold-run replay: an average 1.5C/reading is below the fast threshold: no predictive cut",
+      limits()[0] == 600.0, limits())
+ctl, gov = rise([66, 67, 69, 70, 72, 75])
+check("...the measured law cuts at the target instead (climbing, no grace: -30 W)",
+      limits()[0] == 570.0, limits())
 ctl, gov = rise([72, 73, 74, 75])           # slow climb, 1C per reading
 check("slow climb 73 -> 74 -> 75: at the target and still climbing -> cut at once (-30 W)",
       limits()[0] == 570.0, limits())
@@ -869,14 +885,14 @@ check("GPU1 busy, GPU0 idle: 150 / 550 (soft total: idle GPU0 at 20 W counted at
 set_temp(50, 81)
 for _ in range(4):
     ctl.update(); gov.update(); CLOCK.advance(2.0)
-check("a (predictive, 50%) thermal cut on the busy card (550 -> 275); the idle card holds "
-      "what it frees ahead of time (325)", limits() == [325.0, 275.0], limits())
+check("a thermal cut on the busy card (measured +1C, -60 W twice: 550 -> 430); the idle card "
+      "isn't cut", limits()[1] == 430.0 and limits()[0] <= 175.0, limits())
 check("...the cold idle card isn't cut at all (only the hot card is)", gov.cap_w[0] == 600.0,
       gov.cap_w)
 busy_cards(True, True)
 ok = run(ctl, 2, total=600.0)
-check("GPU0 wakes: at once it gets its share plus what hot GPU1 can't use (325), GPU1 stays "
-      "at its 275 W thermal cap, the sum 600", limits() == [325.0, 275.0] and ok, limits())
+check("GPU0 wakes: at once it gets its 300 W share (GPU1 lowered first), the sum 600",
+      limits() == [300.0, 300.0] and ok, limits())
 
 # the original bug, when the idle card is itself over the target (warmed by its neighbour)
 ctl, gov, *_ = rig(saved={"profile": "quiet", "ceiling": "600", "total": "600", "target": "80"})
@@ -886,8 +902,8 @@ run(ctl, 8, total=600.0)
 set_temp(81, 81)
 for _ in range(4):
     ctl.update(); gov.update(); CLOCK.advance(2.0)
-check("a hot IDLE card's cap is cut from its cap (600 -> 300), not recorded as its share",
-      gov.cap_w[0] == 300.0 and limits()[0] == 300.0, (gov.cap_w, limits()))
+check("a hot IDLE card's cap is cut from its cap (600 -> 480), not recorded as its share",
+      gov.cap_w[0] == 480.0, (gov.cap_w, limits()))
 busy_cards(True, True)
 ok = run(ctl, 2, total=600.0)
 check("...so when it wakes it gets 300 W at once, not 150", limits()[0] == 300.0 and ok, limits())
@@ -924,10 +940,10 @@ set_temp(45, 49)
 run(ctl, 7, total=600.0)
 check("both idle: 300 / 300", limits() == [300.0, 300.0] and not any(gov._busy), (limits(), gov._busy))
 busy_cards(False, True)
-set_temp(45, 57)                              # +8C in one reading: a predictive cut, now
+set_temp(45, 67)                              # busy, and 2C over the target in the same reading
 ctl.update()
-check("the cut lowers the card that just got busy (300 -> 150), in that same tick",
-      limits() == [300.0, 150.0], limits())
+check("the cut lowers the card that just got busy (300 -> 180), in that same tick",
+      limits() == [300.0, 180.0], limits())
 
 print("\n== only the hot card is cut; the cold busy card takes the share it frees ==")
 ctl, gov, *_ = rig(saved={"profile": "quiet", "ceiling": "600", "total": "750", "target": "80"})

@@ -90,7 +90,7 @@ or target is acknowledged as *masked by a command-line flag*.
 | Condition | Action |
 |---|---|
 | Card ≥ `--temp-emergency` for 2 s | Every GPU to its hardware minimum (150 W). Fans: 100% unless the profile is `native` with mirror off. Released at emergency − 30 °C for 30 s, then walks up +20 W / 30 s |
-| Card at the target (adaptive: and fans at its fan max) | Power cut on the hot card(s) only: 30 W × 2^(°C over), at most 50%. A 5 s grace only if the card is steady; none if it's still climbing; a cut before the target if it rises ≥ 2 °C in one reading. Released at target − 2 °C for 30 s (adaptive: below the target for 10 s), then exponential recovery per card, waiting while a card is still warming (fork decisions/009, plan 003) |
+| Card at the target (adaptive: and fans at its fan max) | Power cut on the hot card(s) only: 30 W × 2^(°C over), at most 50%. A 5 s grace only if the card is steady; none if it's still climbing; a bounded cut (≤ 120 W) before the target if it rises in two readings in a row averaging ≥ 2 °C/reading; once over the target, the measured excess sizes the cut. Released at target − 2 °C for 30 s (adaptive: below the target for 10 s), then exponential recovery per card, waiting while a card is still warming (fork decisions/009, plan 003) |
 | A card's temperature unreadable in 3 of the last 5 readings | Blind: every GPU to its minimum power, owned fans 100% (`native` left alone); released after 30 s of good readings, +20 W steps. A single missed reading counts at the last known temperature |
 | UPS status matches `--power-floor-on` | Every GPU to its hardware floor, immediately |
 | UPS unreadable 3× | Clamp to `--power-fallback` (never raising a card that's in a hold) |
