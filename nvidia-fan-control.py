@@ -105,7 +105,9 @@ DEFAULT_PROFILE = "native"
 # the target, and unwinds fast above it. It only ever makes the fans quieter than the ramp.
 TARGET_FAN_MIN_PCT = 30
 TARGET_FAN_APPROACH_BAND_C = 20
-TARGET_FAN_SLEW_UP_PCT = 10
+# Up: straight to the demand, as the fixed curves do (operator, 2026-09-30). Climbing +10% a
+# reading let a vLLM burst after a lull outrun the fans on pve-ai (63 -> 86 C in 8 s while
+# the fans went 46 -> 90%). Down: 2% a reading, so the fans can't flap.
 TARGET_FAN_SLEW_DOWN_PCT = 2
 TARGET_TRACKING_BAND_C = 8
 TARGET_TRIM_MIN_PCT = -50.0
@@ -2318,7 +2320,7 @@ class FanController:
         if emergency:
             command = 100
         elif demand > self._commanded_fan_pct:
-            command = min(demand, self._commanded_fan_pct + TARGET_FAN_SLEW_UP_PCT)
+            command = demand            # up: at once (the down side eases)
         else:
             command = max(demand, self._commanded_fan_pct - TARGET_FAN_SLEW_DOWN_PCT)
         command = command if emergency else min(fan_max, command)

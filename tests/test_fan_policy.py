@@ -424,6 +424,22 @@ ctl.profile = nfc.FanProfile("adaptive", 50)
 tick(ctl, 1)
 check("emergency forces 100% even above adaptive's fan max", fans() == [100, 100], fans())
 
+print("\n== adaptive fans jump up to the curve, and ease down (operator, 2026-09-30) ==")
+# pve-ai 03:16:58: after a lull the fans were at 46%; a vLLM burst took GPU1 63 -> 78 -> 86C
+# in 8 s while the fans climbed +10% a reading behind it
+ctl, gov, *_ = rig(saved={"profile": "adaptive:90", "target": "85"})
+set_temp(63, 45)
+tick(ctl, 10)
+low = max(fans())
+set_temp(78, 45)
+tick(ctl, 1)
+jumped = max(fans())
+check("a burst after a lull: the fans jump straight to adaptive's demand at 78C (~75%), not "
+      "+10% a reading", low <= 40 and jumped >= 70, (low, fans()))
+set_temp(70, 45)
+tick(ctl, 1)
+check("...and ease down 2% a reading when it cools", max(fans()) == jumped - 2, (jumped, fans()))
+
 print("\n== adaptive learns downward below the target, never below the floor ==")
 ctl, gov, store, state, run = rig(saved={"profile": "adaptive", "target": "80"})
 set_temp(76, 60)

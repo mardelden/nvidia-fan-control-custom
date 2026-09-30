@@ -55,6 +55,11 @@ trim that pulls the fans down to the quietest speed that still holds the target.
 learns downward slowly, holds at the target, and unwinds fast if the card gets hotter. What
 it has learned survives a restart.
 
+**Up at once, down gently.** Like the fixed curves, adaptive's fans go straight **up** to what
+the curve (plus trim) asks for, and ease **down** by 2% a reading. They used to climb +10% a
+reading, and a vLLM burst after a lull outran them (63 → 86 °C in 8 s while the fans went
+46 → 90%).
+
 **It also unlearns.** Parked at the target with quiet fans, a bursty load, such as vLLM, turns
 every burst into a power cut. So each power cut for heat raises a **floor under the trim** by
 20% (−50 → −30 → −10 → 0). A workload that keeps getting cut ends up with the fans on the
