@@ -863,21 +863,19 @@ ctl, gov, *_ = rig(saved={"profile": "quiet", "ceiling": "600", "total": "600", 
 busy_cards(False, True)
 set_temp(50, 70)
 run(ctl, 8, total=600.0)
-check("GPU1 busy, GPU0 idle: 150 / 525 (soft total: the idle card counted at 75 W)",
-      limits() == [150.0, 525.0], limits())
+check("GPU1 busy, GPU0 idle: 150 / 550 (soft total: idle GPU0 at 20 W counted at 50 W)",
+      limits() == [150.0, 550.0], limits())
 set_temp(50, 81)
 for _ in range(4):
     ctl.update(); gov.update(); CLOCK.advance(2.0)
-check("a (predictive, 50%) thermal cut on the busy card (525 -> 262.5); the idle card holds "
-      "what it frees ahead of time (337)", limits()[1] == 262.5 and 337.0 <= limits()[0] <= 338.0,
-      limits())
+check("a (predictive, 50%) thermal cut on the busy card (550 -> 275); the idle card holds "
+      "what it frees ahead of time (325)", limits() == [325.0, 275.0], limits())
 check("...the cold idle card isn't cut at all (only the hot card is)", gov.cap_w[0] == 600.0,
       gov.cap_w)
 busy_cards(True, True)
 ok = run(ctl, 2, total=600.0)
-check("GPU0 wakes: at once it gets its share plus what hot GPU1 can't use (337), GPU1 stays "
-      "at its 262.5 W thermal cap, the sum within 600", 337.0 <= limits()[0] <= 338.0
-      and limits()[1] == 262.5 and sum(limits()) <= 600.5 and ok, limits())
+check("GPU0 wakes: at once it gets its share plus what hot GPU1 can't use (325), GPU1 stays "
+      "at its 275 W thermal cap, the sum 600", limits() == [325.0, 275.0] and ok, limits())
 
 # the original bug, when the idle card is itself over the target (warmed by its neighbour)
 ctl, gov, *_ = rig(saved={"profile": "quiet", "ceiling": "600", "total": "600", "target": "80"})
@@ -900,8 +898,8 @@ run(ctl, 8, total=600.0)
 gov.ups.read = lambda: (1000.0, ("OL",))
 gov._feedback_wait_total_w = None
 gov.update(force=True)
-check("UPS over by 100 W: busy GPU1 525 -> 425, idle GPU0 stays at 150",
-      limits() == [150.0, 425.0], limits())
+check("UPS over by 100 W: busy GPU1 550 -> 450, idle GPU0 stays at 150",
+      limits() == [150.0, 450.0], limits())
 check("...and GPU0's own cap is trimmed from its cap (600 -> 500), not set to 150",
       gov.cap_w[0] == 500.0, gov.cap_w)
 busy_cards(True, True)
@@ -1104,8 +1102,8 @@ ctl, gov, *_ = rig(saved={"ceiling": "600", "total": "600"}, budget=900, now=300
 gov.ups.read = lambda: (400.0, ("OL",))
 busy_cards(False, True)
 ok = run(ctl, 7, total=600.0)
-check("cards left at 300 W by the last run: GPU1 gets its 525 W share (soft), no crawl",
-      limits() == [150.0, 525.0] and ok, limits())
+check("cards left at 300 W by the last run: GPU1 gets its 550 W share (soft), no crawl",
+      limits() == [150.0, 550.0] and ok, limits())
 ctl, gov, *_ = rig(saved={"ceiling": "600"}, budget=900, now=300.0)
 check("without a total, a restart still starts from the current limits (unchanged)",
       gov.cap_w == [300.0, 300.0], gov.cap_w)
@@ -1114,15 +1112,40 @@ print("\n== the soft total (operator): a lone busy card gets total - 75, not tot
 ctl, gov, *_ = rig(saved={"ceiling": "600", "total": "700"})
 busy_cards(False, True)
 run(ctl, 8, total=700.0)
-check("total 700: busy GPU1 gets 600 (700 - 75, capped at 600), idle GPU0 sits at its 150 floor",
+check("total 700: busy GPU1 gets 600 (700 - 50, capped at 600), idle GPU0 sits at its 150 floor",
       limits() == [150.0, 600.0], limits())
-check("...the limits add up to 750, within the soft bound (700 + 75 for the idle card)",
+check("...the limits add up to 750, within the soft bound (700 + 100 for the idle card)",
       sum(limits()) <= gov.limit_sum_bound_w() + 0.5, (limits(), gov.limit_sum_bound_w()))
+
 busy_cards(True, True)
 trace = []
 run(ctl, 3, total=700.0, trace=trace)
 check("GPU0 wakes: GPU1 lowered first, then an equal split within the hard total (350 / 350)",
       limits() == [350.0, 350.0] and trace[0][1] == 350.0, trace)
+
+# counted at what it really draws: the 10 s peak + 10 W, in 25 W steps
+ctl, gov, *_ = rig(saved={"ceiling": "600", "total": "600"})
+busy_cards(False, True)
+run(ctl, 8, total=600.0)
+check("idle GPU0 at 20 W is counted at 50 W: busy GPU1 gets 550", limits() == [150.0, 550.0]
+      and gov._idle_reserve_w(0) == 50.0, (limits(), gov._idle_reserve_w(0)))
+seen = set()
+for w in (15.0, 25.0, 18.0, 22.0, 16.0, 24.0):
+    nv.DEVS[0].draw = w
+    run(ctl, 1, total=600.0)
+    seen.add(tuple(limits()))
+check("the idle wobble (15-25 W) doesn't move the split", seen == {(150.0, 550.0)}, seen)
+nv.DEVS[0].draw = 60.0                       # still idle (<= 75 W, util 0), drawing more
+trace = []
+ok = run(ctl, 3, total=600.0, trace=trace)
+check("idle GPU0 creeps to 60 W: counted at 75 W, busy GPU1 lowered to 525", limits() == [150.0, 525.0]
+      and gov._idle_reserve_w(0) == 75.0, (limits(), gov._idle_reserve_w(0)))
+nv.DEVS[0].draw = 20.0
+run(ctl, 3, total=600.0)
+check("...back to 20 W: still counted at 75 W until the 60 W reading is 10 s old",
+      limits() == [150.0, 525.0], limits())
+run(ctl, 5, total=600.0)
+check("...then 50 W again: busy GPU1 back to 550", limits() == [150.0, 550.0], limits())
 
 print("\n== deploy-team review of plan 003 ==")
 # effective.json follows the governor, not just settings changes

@@ -220,3 +220,11 @@ total soft. "The system can tolerate a few seconds" over it.
 
 Prepared and unit-tested only (226 + 23), **not deployed or hardware-tested** (operator,
 2026-09-29).
+
+**Revised the same day (operator):** "we should just see how much it consumes". An idle card is
+now counted at its **measured** draw: its highest over the last 10 s
+(`ALLOC_DRAW_WINDOW_S`), plus 10 W, rounded up to 25 W steps so the 15–25 W idle wobble doesn't
+move the split every tick. It's never counted above its minimum, and until there are readings
+it's counted at 75 W. On pve-ai that's ~50 W, so a lone busy card gets total − 50. If an idle
+card's draw creeps up, its count rises and the busy card is lowered first. A waking card can
+overshoot by at most 150 W minus its count. 231 + 23 unit tests; still not deployed.

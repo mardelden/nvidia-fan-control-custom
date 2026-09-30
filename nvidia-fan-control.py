@@ -32,6 +32,7 @@ import errno
 import fcntl
 import json
 import logging
+import math
 import os
 import signal
 import subprocess
@@ -229,13 +230,18 @@ POWER_IDLE_DWELL_S = 60.0
 # or POWER_IDLE_UTIL_PCT), and as idle only after ALLOC_IDLE_DWELL_S below both, so a pause
 # between requests doesn't move power around.
 ALLOC_IDLE_DWELL_S = 10.0
-# A SOFT total (operator, 2026-09-29): an idle card is counted at ALLOC_IDLE_RESERVE_W, the
-# most an idle card draws (above it, it counts as busy), not at its 150 W minimum limit. So
-# a lone busy card gets total - 75 W (600 W at a 700 W total) instead of total - 150. The
-# sum of the LIMITS may exceed the total by (minimum - reserve) per idle card; the sum of the
-# DRAW stays within it, except for a tick or two when an idle card wakes, until the busy
-# card is lowered.
+# A SOFT total (operator, 2026-09-29): an idle card is counted at what it actually draws, not
+# at its 150 W minimum limit: its highest draw over the last ALLOC_DRAW_WINDOW_S, plus
+# ALLOC_IDLE_RESERVE_MARGIN_W, rounded up to ALLOC_IDLE_RESERVE_STEP_W (so the idle wobble
+# doesn't move the split every tick), never above its minimum. Until there are readings it's
+# counted at ALLOC_IDLE_RESERVE_W, the most an idle card can draw (above it, it counts as
+# busy). The sum of the LIMITS may exceed the total by (minimum - reserve) per idle card; the
+# DRAW stays within it, except for a tick or two when an idle card wakes, until the busy card
+# is lowered.
 ALLOC_IDLE_RESERVE_W = POWER_IDLE_DRAW_W
+ALLOC_DRAW_WINDOW_S = 10.0
+ALLOC_IDLE_RESERVE_MARGIN_W = 10.0
+ALLOC_IDLE_RESERVE_STEP_W = 25.0
 
 # Fail-safe: if the UPS can't be read this many times in a row we are flying blind, so
 # clamp to a conservative per-GPU limit rather than assume headroom.
@@ -685,6 +691,7 @@ class PowerGovernor:
         self._busy: List[bool] = []
         self._quiet_since: List[Optional[float]] = []
         self._last_busy_now: Optional[List[bool]] = None
+        self._draw_hist: List[List[Tuple[float, float]]] = []   # per card: (time, W), last 10 s
         self._last_busy_at: List[float] = []
         self._last_temps: Optional[Dict[int, int]] = None
         self._fan_threshold: Optional[int] = None      # set while adaptive drives the fans
@@ -718,6 +725,7 @@ class PowerGovernor:
         self._busy = [True] * len(self.handles)          # assume busy until measured
         self._quiet_since = [None] * len(self.handles)
         self._last_busy_at = [time.monotonic()] * len(self.handles)
+        self._draw_hist = [[] for _ in self.handles]
 
         dry = "  [DRY RUN — nothing will be set]" if self.dry_run else ""
         if self.budget_w is None:
@@ -1106,8 +1114,9 @@ class PowerGovernor:
         note = (f"; above the {top:.0f} W sum of the GPUs' ceilings, so it doesn't bind"
                 if total >= top - 0.5 else "")
         log.info(f"POWER: total ceiling set to {total:g} W across {n} GPU(s) ({source}); "
-                 f"soft: idle GPUs counted at {ALLOC_IDLE_RESERVE_W:.0f} W, the busy ones "
-                 f"share the rest{note}")
+                 f"soft: idle GPUs counted at their measured draw (10 s peak + "
+                 f"{ALLOC_IDLE_RESERVE_MARGIN_W:.0f} W, in {ALLOC_IDLE_RESERVE_STEP_W:.0f} W "
+                 f"steps), the busy ones share the rest{note}")
         self._allocate(time.monotonic(), refresh=True)
         if self.budget_w is None:
             self._hold_ceiling()
@@ -1157,10 +1166,24 @@ class PowerGovernor:
             level = lo_level
         return [float(int(min(h, max(lo, level)))) for lo, h in zip(lows, highs)]
 
+    def _note_draws(self, draws: List[float], now: float):
+        for i, w in enumerate(draws):
+            if i < len(self._draw_hist):
+                hist = self._draw_hist[i]
+                hist.append((now, w))
+                while hist and now - hist[0][0] > ALLOC_DRAW_WINDOW_S:
+                    hist.pop(0)
+
     def _idle_reserve_w(self, i: int) -> float:
-        """What an idle card is counted at in the (soft) total: what it can draw while
-        idle, not its minimum limit."""
-        return min(ALLOC_IDLE_RESERVE_W, self.min_w[i])
+        """What an idle card is counted at in the (soft) total: what it actually draws (its
+        highest draw over the last 10 s, plus a margin, rounded up to 25 W steps), never
+        above its minimum limit. Until there are readings: the most an idle card can draw."""
+        hist = self._draw_hist[i] if i < len(self._draw_hist) else []
+        if not hist:
+            return min(ALLOC_IDLE_RESERVE_W, self.min_w[i])
+        peak = max(w for _, w in hist) + ALLOC_IDLE_RESERVE_MARGIN_W
+        step = ALLOC_IDLE_RESERVE_STEP_W
+        return min(self.min_w[i], step * max(1, math.ceil(peak / step)))
 
     def _shares(self, busy: List[bool]) -> List[float]:
         """Split the total (soft). The busy cards share it first, each up to what it can
@@ -1234,6 +1257,8 @@ class PowerGovernor:
         if refresh:
             reading = self._read_activity()
             self._note_activity(reading[1] if reading is not None else [True] * n, now)
+            if reading is not None:
+                self._note_draws(reading[0], now)
         if self.total_w is None:
             return
         want = self._shares(self._busy)
@@ -1267,8 +1292,10 @@ class PowerGovernor:
                 if self.cap_w:
                     self._set_limit(i, self._limit_for(i))
         log.info(f"POWER: total {self.total_w:g} W -> "
-                 + " / ".join(f"GPU {i} {new[i]:.0f} W ({'busy' if self._busy[i] else 'idle'})"
-                              for i in range(n))
+                 + " / ".join(f"GPU {i} {new[i]:.0f} W ("
+                              + ("busy" if self._busy[i]
+                                 else f"idle, counted at {self._idle_reserve_w(i):.0f} W")
+                              + ")" for i in range(n))
                  + (" (raises next tick)" if lowering and any(want[i] > old[i] + 0.5
                                                                for i in range(n)) else ""))
 
