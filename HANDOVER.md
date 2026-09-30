@@ -29,7 +29,7 @@ other.
 | `fan-mirror` | `on` `off` | `off` |
 | `temp-target` | °C, or `none` | no target |
 | `power-ceiling` | `W`, `W,W`, or `none` | the hardware max |
-| `power-ceiling-total` | `W` (all GPUs together), or `none` | no total |
+| `power-ceiling-total` | `W` (all GPUs together), or `none` | the **last total** if one was in force (only `none` clears it); otherwise no total |
 
 Changes are picked up live (≤ 2 s; `systemctl reload` re-reads at once), and each one is
 acknowledged in the journal with a line starting `FAN:`, `TEMP:` or `POWER:`. **A line
@@ -95,7 +95,7 @@ or target is acknowledged as *masked by a command-line flag*.
 | UPS status matches `--power-floor-on` | Every GPU to its hardware floor, immediately |
 | UPS unreadable 3× | Clamp to `--power-fallback` (never raising a card that's in a hold) |
 | Total ceiling set (soft) | Idle cards counted at their measured draw (10 s peak + 10 W, in 25 W steps; typically 50 W), their limit staying at the 150 W floor; the busy cards share the rest, each up to its ceiling and its own cut; idle cards also hold what the busy ones can't use; lowered before raised. The draw stays within the total, except for a tick or two when an idle card wakes (at most 150 W minus the idle card's count, per waking card). An idle, cool card's old cuts are cleared after 60 s |
-| Total UPS load > budget | Trim every card by the measured excess; restore slowly (+20 W). Only a thermal-hold recovery raises faster, bounded by headroom, and it waits for a fresh UPS sample |
+| Total UPS load > budget | For 20 s: nothing (a short excursion is allowed; none above the UPS's rating). Then trim every card by the measured excess; restore slowly (+20 W). Only a thermal-hold recovery raises faster, bounded by headroom, and it waits for a fresh UPS sample |
 | Service stops cleanly | Fans → factory curve. Power is **never raised**: the ceiling, holds, the on-battery floor, budget trims and an out-of-band `nvidia-smi -pl` lower all stay until the next start |
 | Service crashes | Fans stay where they were unless `ExecStopPost=--reset-fans` runs (see above) |
 | Restart / reboot | Settings come back from the files. The learned adaptive trim is restored; thermal and emergency holds are restored if < 5 min old |

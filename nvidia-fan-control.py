@@ -227,6 +227,11 @@ POWER_DEADBAND_W = 15
 POWER_SLEW_DOWN_W = 150
 POWER_SLEW_UP_W = 20
 POWER_OVER_GRACE_TICKS = 1
+# Operator (2026-09-30): crossing the budget for 20-30 s is fine, so a short burst isn't
+# trimmed. Only a load that stays over the budget for POWER_OVER_GRACE_S is. Above the UPS's
+# own rating (ups.realpower.nominal) there's no grace; with the rating unknown, none either.
+# On battery the floor still clamps at once (a separate path).
+POWER_OVER_GRACE_S = 20.0
 POWER_RESTORE_MARGIN_W = 50
 POWER_RESTORE_HEADROOM_TICKS = 3
 POWER_RESTORE_DWELL_S = 30.0
@@ -544,7 +549,9 @@ class SettingsStore:
             if self.effective.get(name) != (value, source):
                 prev = self.effective.get(name)
                 self.effective[name] = (value, source)
-                if prev is None or prev[0] != value:
+                # the total also on a source change: "no file" (keep the last total) and an
+                # explicit `none` (clear it) are the same value but mean different things
+                if prev is None or prev[0] != value or (name == "total" and prev[1] != source):
                     changes.append((name, value, source))
         if force:
             self.generation += 1
@@ -665,6 +672,7 @@ class PowerGovernor:
         self._last_run = 0.0
         self._was_power_floor = False
         self._over_ticks = 0
+        self._over_since: Optional[float] = None
         self._feedback_wait_total_w: Optional[float] = None
         self._feedback_wait_status_flags: Tuple[str, ...] = ()
         self._feedback_wait_since = 0.0
@@ -1626,6 +1634,7 @@ class PowerGovernor:
         # a full dwell, reset to MAX (in steps, if recovering from a hold).
         if active_gpu_count == 0:
             self._over_ticks = 0
+            self._over_since = None
             self._headroom_ticks = 0
             if self._idle_since is None:
                 self._idle_since = now
@@ -1667,10 +1676,15 @@ class PowerGovernor:
         if over > POWER_DEADBAND_W:
             self._headroom_ticks = 0
             self._over_ticks += 1
-            if self._over_ticks < POWER_OVER_GRACE_TICKS:
+            if self._over_since is None:
+                self._over_since = now
+            over_for = now - self._over_since
+            rating_w = self.ups.nominal_w
+            if (rating_w is not None and total_w <= rating_w
+                    and over_for < POWER_OVER_GRACE_S):
                 log.info(f"POWER: ups={total_w:.0f}W over budget {self.budget_w:.0f}W by "
-                         f"{over:.0f}W (grace {self._over_ticks}/{POWER_OVER_GRACE_TICKS}) — "
-                         "letting it pass, limits held "
+                         f"{over:.0f}W for {over_for:.0f}/{POWER_OVER_GRACE_S:.0f}s (grace; "
+                         f"within the UPS's {rating_w} W rating) — limits held "
                          + "/".join(f"{w:.0f}" for w in self.applied_w) + "W")
                 return
             # as before: every card is cut by the excess over the busy count (the idle ones
@@ -1682,6 +1696,7 @@ class PowerGovernor:
             mode = "throttle"
         else:
             self._over_ticks = 0
+            self._over_since = None
             if total_w >= self.budget_w - POWER_RESTORE_MARGIN_W:
                 self._headroom_ticks = 0
                 log.info(f"POWER: ups={total_w:.0f}W gpu={gpu_draw:.0f}W other={non_gpu:.0f}W "
@@ -1894,7 +1909,18 @@ class FanController:
             self.governor.apply_ceiling(value, describe_source(self.store, "ceiling", source))
         if "total" in by_name:
             value, source = by_name["total"]
-            self.governor.apply_total(value, describe_source(self.store, "total", source))
+            described = describe_source(self.store, "total", source)
+            if value is None and source == "default":
+                # the file is gone or unreadable: fail closed (deploy-team review #2, the
+                # operator's choice B). Only an explicit `none` clears the total.
+                keep = (self.governor.total_w if self.governor.total_w is not None
+                        else self._remembered_total())
+                if keep is not None:
+                    self._note(f"⚠ POWER: no readable total ceiling file "
+                               f"({self.store.path('saved', 'total')}) — keeping the last total "
+                               f"{keep:g} W; write `none` to clear it", True)
+                    value, described = keep, "kept: the file is missing or unreadable"
+            self.governor.apply_total(value, described)
         if "target" in by_name:
             value, source = by_name["target"]
             self._set_target(value, describe_source(self.store, "target", source))
@@ -2259,6 +2285,16 @@ class FanController:
             except OSError:
                 pass
 
+    def _remembered_total(self) -> Optional[float]:
+        """The last total in force, from the runtime state (None if it was cleared)."""
+        try:
+            with open(self._runtime_path()) as f:
+                state = json.load(f)
+            w = (state.get("power") or {}).get("total_w") if isinstance(state, dict) else None
+            return float(w) if w else None
+        except (OSError, ValueError, TypeError, AttributeError):
+            return None
+
     def _apply_runtime_state(self, state: dict):
         age = time.time() - float(state.get("saved_at", 0))
         adaptive = state.get("adaptive") or {}
@@ -2297,6 +2333,7 @@ class FanController:
             "adaptive": adaptive,
             "thermal": {"limited": self.governor.thermal_limited},
             "emergency": {"active": self.governor.emergency_active},
+            "power": {"total_w": self.governor.total_w},
         }
         try:
             os.makedirs(self.state_dir, exist_ok=True)

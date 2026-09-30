@@ -162,7 +162,9 @@ With `700` on pve-ai, one busy card runs at 600 W (700 − ~50, capped by its 60
 while the other idles at its 150 W floor, and two busy cards get 350 W each. Unlike the UPS
 budget, the total holds however fast the load arrives, within the soft margin above, because
 it bounds what the cards *can* draw. The UPS budget stays: it covers the CPU and disks
-and trims sustained load. A total below the GPUs' combined minimum (300 W) is refused.
+and trims sustained load. A total below the GPUs' combined minimum (300 W) is refused. **If the total file goes
+missing or unreadable, the last total stays in force**; only an explicit `none` clears it (it
+fails closed: with a 600 W ceiling, no total would mean 600/600).
 
 ### The UPS budget
 
@@ -172,6 +174,11 @@ reading, then restores slowly: three consecutive readings with headroom, +20 W, 
 30 s between raises. Only a recovery from a thermal hold takes the faster exponential step,
 bounded by the measured headroom, and then waits for a fresh UPS sample before the next one. An `OB` status clamps every GPU to its floor. If the UPS can't be read
 3 times in a row, the cards go to `--power-fallback`.
+
+**A short excursion is allowed.** The operator accepts 20–30 s over the budget, so a card is
+trimmed only once the load has stayed over the budget for **20 s**. Above the UPS's own
+rating (`ups.realpower.nominal`, 1,000 W on pve-ai) there's no grace. On battery (`OB`) the
+floor still clamps at once.
 
 The UPS is a **pull**, and a coarse one: `ups.load` is an integer percent of nominal (10 W
 steps on a 1000 W unit) and it refreshes on NUT's full-poll cycle (`pollfreq`). The budget

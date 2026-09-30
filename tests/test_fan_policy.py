@@ -1234,6 +1234,80 @@ busy_cards(True, True)
 run(ctl, 4, total=700.0)
 check("first UPS reading fine: full shares (350 / 350)", limits() == [350.0, 350.0], limits())
 
+print("\n== UPS grace (operator): 20 s over the budget is fine, above the UPS rating isn't ==")
+ctl, gov, *_ = rig(saved={"ceiling": "300"}, budget=900)
+gov.ups.nominal_w = 1000
+for d in nv.DEVS:
+    d.draw, d.util = 300.0, 90
+gov.ups.read = lambda: (950.0, ("OL",))
+for _ in range(3):                           # 15 s over the budget, within the rating
+    gov._feedback_wait_total_w = None
+    gov.update(force=True); CLOCK.advance(5.0)
+check("950 W for 15 s (budget 900, rating 1000): no trim yet", limits() == [300.0, 300.0], limits())
+gov.update(force=True); CLOCK.advance(5.0)
+gov._feedback_wait_total_w = None
+gov.update(force=True)
+check("...still over after 20 s: trimmed", max(limits()) < 300.0, limits())
+ctl, gov, *_ = rig(saved={"ceiling": "300"}, budget=900)
+gov.ups.nominal_w = 1000
+for d in nv.DEVS:
+    d.draw, d.util = 300.0, 90
+gov.ups.read = lambda: (1050.0, ("OL",))
+gov.update(force=True)
+check("1050 W, above the UPS's 1000 W rating: trimmed at once", max(limits()) < 300.0, limits())
+ctl, gov, *_ = rig(saved={"ceiling": "300"}, budget=900)
+gov.ups.nominal_w = 1000
+for d in nv.DEVS:
+    d.draw, d.util = 300.0, 90
+gov.ups.read = lambda: (950.0, ("OL",))
+gov.update(force=True); CLOCK.advance(10.0)
+gov.ups.read = lambda: (850.0, ("OL",))
+gov.update(force=True); CLOCK.advance(5.0)
+gov.ups.read = lambda: (950.0, ("OL",))
+for _ in range(3):
+    gov._feedback_wait_total_w = None
+    gov.update(force=True); CLOCK.advance(5.0)
+check("a dip under the budget restarts the grace", limits() == [300.0, 300.0], limits())
+
+print("\n== a missing or unreadable total file keeps the last total (review #2, option B) ==")
+ctl, gov, store, state, run_dir = rig(saved={"ceiling": "600", "total": "700"})
+run(ctl, 2, total=700.0)
+ctl.save_runtime_state(force=True)
+os.remove(os.path.join(state, nfc.SETTING_FILES["total"]))
+CLOCK.advance(0.01)
+run(ctl, 2, total=700.0)
+check("the file deleted: the 700 W total stays in force", gov.total_w == 700.0, gov.total_w)
+nv.reset(2)
+store2 = nfc.SettingsStore(state, run_dir, {})
+gov2 = nfc.PowerGovernor(handles=[], interval=5.0)
+ctl2 = nfc.FanController(store2, gov2, poll_interval=2.0, emergency_c=92, state_dir=state,
+                         run_dir=run_dir)
+ctl2.init()
+check("a restart with the file still missing: the last total (700) from the runtime state",
+      gov2.total_w == 700.0, gov2.total_w)
+with open(os.path.join(state, nfc.SETTING_FILES["total"]), "w") as f:
+    f.write("seven hundred\n")
+nv.reset(2)
+store3 = nfc.SettingsStore(state, run_dir, {})
+gov3 = nfc.PowerGovernor(handles=[], interval=5.0)
+ctl3 = nfc.FanController(store3, gov3, poll_interval=2.0, emergency_c=92, state_dir=state,
+                         run_dir=run_dir)
+ctl3.init()
+check("a restart with a malformed file: still the last total (fails closed)", gov3.total_w == 700.0,
+      gov3.total_w)
+write(state, "total", "none")
+run(ctl3, 2, total=1e9)
+check("an explicit `none` clears it", gov3.total_w is None, gov3.total_w)
+ctl3.save_runtime_state(force=True)
+os.remove(os.path.join(state, nfc.SETTING_FILES["total"]))
+nv.reset(2)
+store4 = nfc.SettingsStore(state, run_dir, {})
+gov4 = nfc.PowerGovernor(handles=[], interval=5.0)
+ctl4 = nfc.FanController(store4, gov4, poll_interval=2.0, emergency_c=92, state_dir=state,
+                         run_dir=run_dir)
+ctl4.init()
+check("...and once cleared, a later missing file means no total", gov4.total_w is None, gov4.total_w)
+
 print("\n== unequal per-GPU ceilings no longer collapse on a cut (the shared-cap bug) ==")
 ctl, gov, *_ = rig(saved={"profile": "quiet", "ceiling": "600,300", "target": "80"})
 set_temp(81, 50)
