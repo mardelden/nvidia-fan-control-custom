@@ -16,7 +16,7 @@ since rewritten. The design history is in `plans/` and `plans/decisions/`.
 
 ## The settings
 
-There are four **live** settings. Each one is picked up without a restart and survives
+There are five **live** settings. Each one is picked up without a restart and survives
 reboots:
 
 | Setting | Values | No file means |
@@ -25,6 +25,7 @@ reboots:
 | **Mirror** | `on` · `off` | `off` |
 | **Temperature target** | °C (50 … emergency − 3), or `none` | no target |
 | **Power ceiling** (per GPU) | `W` · `W,W` · `none` | the hardware max |
+| **Total ceiling** (all GPUs together) | `W` · `none` | no total |
 
 The **safety limits** are set by the deployment as flags on the unit. They are never live
 settings:
@@ -112,6 +113,26 @@ known temperature, so a flaky sensor can't reset the emergency timer or fake a s
 **Stopping the service never raises any card's power.** A ceiling, a hold, a UPS on-battery
 floor or a budget trim all stay in place until the next start.
 
+### The total ceiling
+
+A per-GPU ceiling is a hard bound, but it caps a lone busy card as tightly as two busy
+ones. The **total ceiling** bounds the sum instead, and the governor moves it to whichever
+cards are busy, reading each card's draw and utilization from NVML every 2 s (no lag):
+
+- **Idle cards** (≤ 75 W and ≤ 5% for 10 s) get their minimum, 150 W. The **busy** cards
+  share the rest equally, up to their own per-GPU ceiling. If all the cards are busy, or all
+  are idle, they split it equally.
+- **Lower before raise.** When the split changes, the cards losing power are lowered first,
+  and the others are raised a tick (2 s) later. So the limits never add up to more than the
+  total, even for a moment.
+- **A card that wakes up gets its share at once**, limited only by a real UPS or temperature
+  cut, not by the 150 W it idled at.
+
+With `750` on pve-ai, one busy card runs at 600 W while the other idles at 150 W, and two busy
+cards get ~375 W each. Unlike the UPS budget, the total holds however fast the load arrives,
+because it bounds what the cards *can* draw. The UPS budget stays: it covers the CPU and disks
+and trims sustained load. A total below the GPUs' combined minimum (300 W) is refused.
+
 ### The UPS budget
 
 With `--power-budget`, the governor keeps **total** UPS load (CPU, board and disks included)
@@ -133,7 +154,7 @@ Each setting is resolved in this order:
 1. **A flag on the command line.** Only for hand-runs.
 2. **A temporary override** in `/run/nvidia-fan-control/`. Cleared by a restart.
 3. **The saved file** in `/var/lib/nvidia-fan-control/`: `fan-profile`, `fan-mirror`,
-   `temp-target`, `power-ceiling`.
+   `temp-target`, `power-ceiling`, `power-ceiling-total`.
 4. **The default.**
 
 Changes to files are picked up within one fan tick (~2 s), and `systemctl reload`
@@ -159,7 +180,8 @@ On the fleet, use **`gpuguard`**, or the deploy team's `just gpu-*-set` recipes.
 the host:
 
 ```bash
-echo 300          > /var/lib/nvidia-fan-control/power-ceiling   # saved, survives reboots
+echo 750          > /var/lib/nvidia-fan-control/power-ceiling-total   # set the total first,
+echo 600          > /var/lib/nvidia-fan-control/power-ceiling         # then raise the ceiling
 echo adaptive:60  > /var/lib/nvidia-fan-control/fan-profile
 echo 85           > /var/lib/nvidia-fan-control/temp-target
 systemctl reload nvidia-fan-control                              # optional: re-read now
@@ -209,13 +231,15 @@ For real load, use the deploy team's `gpu-burn` in the `gpu-test` container (VMI
 - **Raising a limit is supervised.** A lowered ceiling applies at once. After a hold, power
   returns in steps every 30 s, exponentially bigger the cooler the card (+20 W just under the
   line, up to +50% when clearly cool). After an emergency or blind hold it stays at +20 W.
-- **Per-GPU ceilings must be equal for now** (`300`, not `600,300`). Cuts use one shared cap,
-  so the first cut would drop the higher card to the lower card's level. It needs a per-card
-  cap to fix.
+- **Per-GPU ceilings can differ** (`600,300`). Each card has its own cap (plan 003), and a cut
+  takes each card down from its own level.
 - **The 2 s poll is the remaining limit on overshoot.** A hot card at 600 W with 30% fan climbs
   ~6 °C per reading, so one reading is the earliest reaction.
-- **The thermal cut is one shared cap.** When the hottest card is over, every card's cap
-  drops. That's right for back-to-back cards.
+- **The thermal cut hits every card.** When the hottest card is over, every card is cut from
+  its own level. That's right for back-to-back cards. An idle card held at its 150 W share has
+  its cap trimmed instead, so it still gets its full share when it wakes up.
+- **Stopping never raises**, and that includes the total: an idle card stays at its 150 W
+  share after a stop, until the next start.
 - **Changed defaults compared with older versions:** no file now means `native` with mirror
   off. The fixed curves used to sync both cards unless `--independent` was given. Now they're
   per card unless mirror is on.

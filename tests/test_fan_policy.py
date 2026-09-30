@@ -746,6 +746,198 @@ try:
 except Exception as e:
     check("0 GPUs: a tick doesn't raise", False, repr(e))
 
+print("\n== total ceiling: split between the cards, never exceeded (plan 003) ==")
+P = nfc.parse_power_total
+check("total parser", P("750") == 750.0 and P("none") == 0.0 and P("off") == 0.0)
+for bad in ("abc", "-5", "300,300"):
+    try:
+        P(bad); check(f"total {bad!r} refused", False)
+    except ValueError:
+        check(f"total {bad!r} refused", True)
+
+
+def busy_cards(*flags):
+    for d, b in zip(nv.DEVS, flags):
+        d.draw, d.util = (300.0, 90) if b else (20.0, 0)
+
+
+def sum_ok(total=750.0):
+    return sum(limits()) <= total + 0.5
+
+
+def run(ctl, n, dt=2.0, total=750.0, trace=None):
+    ok = True
+    for _ in range(n):
+        ctl.update(); ctl.governor.update(); CLOCK.advance(dt)
+        ok = ok and sum_ok(total)
+        if trace is not None:
+            trace.append(tuple(limits()))
+    return ok
+
+
+# no UPS budget, ceiling 600, total 750
+ctl, gov, *_ = rig(saved={"ceiling": "600", "total": "750"})
+busy_cards(False, False)
+check("start: every card assumed busy, equal split 375/375", limits() == [375.0, 375.0], limits())
+ctl._write_effective()
+doc = json.load(open(os.path.join(ctl.run_dir, "effective.json")))
+check("...and effective.json shows the total and the shares",
+      doc["in_force"]["total"] == "750" and doc["total_shares_w"] == [375, 375],
+      (doc["in_force"], doc.get("total_shares_w")))
+ok = run(ctl, 8)
+check("both idle: still an equal split", limits() == [375.0, 375.0] and ok, limits())
+busy_cards(False, True)
+trace = []
+ok = run(ctl, 8, trace=trace)
+check("GPU1 busy, GPU0 idle for 10 s: 150 / 600", limits() == [150.0, 600.0], limits())
+check("...and the sum never went over 750 W on any tick", ok, trace)
+check("lower before raise: GPU0 went to 150 a tick before GPU1 went up",
+      any(t == (150.0, 375.0) for t in trace), trace)
+busy_cards(True, True)
+trace = []
+ok = run(ctl, 3, trace=trace)
+check("GPU0 wakes: back to 375 / 375 within two ticks", limits() == [375.0, 375.0], limits())
+check("...lowering GPU1 first, the sum never over 750 W", ok and (375.0, 150.0) not in trace
+      and any(t == (150.0, 375.0) for t in trace), trace)
+busy_cards(True, False)
+ok = run(ctl, 3)
+check("a pause under 10 s doesn't move power", limits() == [375.0, 375.0] and ok, limits())
+ok = run(ctl, 5)
+check("GPU1 idle for 10 s: 600 / 150", limits() == [600.0, 150.0] and ok, limits())
+
+ctl, gov, *_ = rig(saved={"ceiling": "300", "total": "750"})
+busy_cards(True, False)
+run(ctl, 8)
+check("a per-GPU ceiling still bounds the busy card (300, not 600)", limits() == [300.0, 150.0],
+      limits())
+ctl, gov, *_ = rig(saved={"ceiling": "500,300", "total": "750"})
+busy_cards(True, True)
+run(ctl, 3)
+check("unequal ceilings: water-filled 450/300 (GPU1 capped, GPU0 takes the rest)",
+      limits() == [450.0, 300.0], limits())
+ctl, gov, *_ = rig(saved={"total": "250"})
+check("a total below the GPUs' minimums (300 W) is refused", gov.total_w is None and
+      limits() == [600.0, 600.0], (gov.total_w, limits()))
+ctl, gov, *_ = rig(saved={"ceiling": "600", "total": "750"})
+busy_cards(True, False)
+run(ctl, 8)
+write(ctl.state_dir, "total", "none")
+run(ctl, 2)
+check("total cleared: each card back to its own ceiling", limits() == [600.0, 600.0], limits())
+
+print("\n== total ceiling with the UPS budget ==")
+ctl, gov, *_ = rig(saved={"ceiling": "600", "total": "750"}, budget=900)
+gov.ups.read = lambda: (400.0, ("OL",))
+busy_cards(False, True)
+ok = run(ctl, 8)
+gov._last_run = 0
+gov.update(force=True)
+check("idle GPU0 at 150, busy GPU1 at 600 under the budget", limits() == [150.0, 600.0] and ok,
+      limits())
+gov.ups.read = lambda: (1000.0, ("OL",))
+gov._feedback_wait_total_w = None
+gov.update(force=True)
+check("UPS over by 100 W: the busy card is cut 100 W, the idle one stays at its minimum",
+      limits() == [150.0, 500.0], limits())
+busy_cards(True, True)
+gov.ups.read = lambda: (850.0, ("OL",))
+ok = run(ctl, 3)
+check("GPU0 wakes during the trim: 375/375 shares (within GPU1's 500 W cap), sum within 750",
+      limits() == [375.0, 375.0] and ok, limits())
+ctl, gov, *_ = rig(saved={"ceiling": "300"}, budget=900)
+for d in nv.DEVS:
+    d.draw, d.util = 300.0, 90
+gov.ups.read = lambda: (1000.0, ("OL",))
+gov.update(force=True)
+check("no total, equal cards: the UPS cut is unchanged (both 300 -> 250)",
+      limits() == [250.0, 250.0], limits())
+
+print("\n== a waking card gets its share at once, even after a cut while it was idle ==")
+# pve-ai 2026-09-29: a thermal cut while GPU0 idled at its 150 W share recorded 150 W as
+# GPU0's own cap, so when it woke it stayed at 150 and crawled back +20 W per 30 s
+ctl, gov, *_ = rig(saved={"profile": "quiet", "ceiling": "600", "total": "600", "target": "80"})
+busy_cards(False, True)
+set_temp(50, 70)
+run(ctl, 8, total=600.0)
+check("GPU1 busy, GPU0 idle: 150 / 450", limits() == [150.0, 450.0], limits())
+set_temp(50, 81)
+for _ in range(4):
+    ctl.update(); gov.update(); CLOCK.advance(2.0)
+check("a (predictive, 50%) thermal cut on the busy card: 150 / 225", limits() == [150.0, 225.0],
+      limits())
+check("...the idle card's own cap is cut from its cap (600 -> 300), not recorded as 150",
+      gov.cap_w[0] == 300.0, gov.cap_w)
+busy_cards(True, True)
+ok = run(ctl, 2, total=600.0)
+check("GPU0 wakes: its 300 W share at once; GPU1 stays at its own 225 W thermal cap",
+      limits() == [300.0, 225.0] and ok, limits())
+
+ctl, gov, *_ = rig(saved={"ceiling": "600", "total": "600"}, budget=900)
+gov.ups.read = lambda: (400.0, ("OL",))
+busy_cards(False, True)
+run(ctl, 8, total=600.0)
+gov.ups.read = lambda: (1000.0, ("OL",))
+gov._feedback_wait_total_w = None
+gov.update(force=True)
+check("UPS over by 100 W: busy GPU1 450 -> 350, idle GPU0 stays at 150",
+      limits() == [150.0, 350.0], limits())
+check("...and GPU0's own cap is trimmed from its cap (600 -> 500), not set to 150",
+      gov.cap_w[0] == 500.0, gov.cap_w)
+busy_cards(True, True)
+gov.ups.read = lambda: (800.0, ("OL",))
+ok = run(ctl, 2, total=600.0)
+check("GPU0 wakes: its 300 W share at once", limits()[0] == 300.0 and ok, limits())
+
+ctl, gov, *_ = rig(saved={"profile": "quiet", "ceiling": "600", "total": "750", "target": "80"})
+busy_cards(True, True)
+set_temp(81, 81)
+run(ctl, 5)
+check("both busy at their 375 W shares and hot: the cut really lowers them (315/315)",
+      limits() == [315.0, 315.0], limits())
+
+print("\n== a card that starts working and is cut in the same tick loses real power ==")
+# pve-ai run 2: GPU1 started, and the very first reading was a fast rise; the cut came before
+# the allocator had marked GPU1 busy, so it trimmed GPU1's cap and left its 300 W in place
+ctl, gov, *_ = rig(saved={"profile": "max", "ceiling": "600", "total": "600", "target": "65"})
+busy_cards(False, False)
+set_temp(45, 49)
+run(ctl, 7, total=600.0)
+check("both idle: 300 / 300", limits() == [300.0, 300.0] and not any(gov._busy), (limits(), gov._busy))
+busy_cards(False, True)
+set_temp(45, 57)                              # +8C in one reading: a predictive cut, now
+ctl.update()
+check("the cut lowers the card that just got busy (300 -> 150), in that same tick",
+      limits() == [300.0, 150.0], limits())
+
+print("\n== a restart with a total starts each card at its full share ==")
+ctl, gov, *_ = rig(saved={"ceiling": "600", "total": "600"}, budget=900, now=300.0)
+gov.ups.read = lambda: (400.0, ("OL",))
+busy_cards(False, True)
+ok = run(ctl, 7, total=600.0)
+check("cards left at 300 W by the last run: GPU1 gets its 450 W share, no crawl",
+      limits() == [150.0, 450.0] and ok, limits())
+ctl, gov, *_ = rig(saved={"ceiling": "600"}, budget=900, now=300.0)
+check("without a total, a restart still starts from the current limits (unchanged)",
+      gov.cap_w == [300.0, 300.0], gov.cap_w)
+
+print("\n== unequal per-GPU ceilings no longer collapse on a cut (the shared-cap bug) ==")
+ctl, gov, *_ = rig(saved={"profile": "quiet", "ceiling": "600,300", "target": "80"})
+set_temp(81, 50)
+for _ in range(4):                               # steady +1C: past the 5 s grace, one cut
+    ctl.update(); CLOCK.advance(2.0)
+check("a thermal cut takes each card down from its own level (-60 W: 540/240), not both to 240",
+      limits() == [540.0, 240.0], limits())
+before = limits()
+set_temp(60, 50)
+trace = []
+for _ in range(40):
+    ctl.update(); gov.update(); CLOCK.advance(2.0)
+    trace.append(tuple(limits()))
+check("recovery never raises a card by more than one step at a time",
+      all(b - a <= 150.0 + 0.5 for prev, cur in zip([tuple(before)] + trace, trace)
+          for a, b in zip(prev, cur)), trace)
+check("...and ends back at 600/300", limits() == [600.0, 300.0], limits())
+
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
     print("FAILED: " + "; ".join(FAIL))

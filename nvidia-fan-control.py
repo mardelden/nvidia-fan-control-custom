@@ -15,6 +15,7 @@ Settings (all live: picked up without a restart, and surviving reboots):
     mirror             on | off         (both fans follow the hotter card; back-to-back cards)
     temperature target degrees C | none
     power ceiling      W | W,W | none   (per GPU)
+    total ceiling      W | none         (all GPUs together, moved to the busy cards)
 
 Each setting is resolved in this order: a command-line flag (hand-run only), then a
 temporary override in the run dir (/run/nvidia-fan-control, cleared on restart), then
@@ -23,7 +24,7 @@ Safety limits (UPS budget, emergency temperature, floor flags, fallback) are
 command-line flags set by the deployment, never live settings.
 
 Run as root: `sudo python3 nvidia-fan-control.py`, or as the systemd service. The
-design is recorded in plans/002-layered-fan-policy.md.
+design is recorded in plans/002-layered-fan-policy.md and plans/003-total-gpu-ceiling.md.
 """
 
 import argparse
@@ -218,6 +219,12 @@ POWER_IDLE_DRAW_W = 75.0
 POWER_IDLE_UTIL_PCT = 5
 POWER_IDLE_DWELL_S = 60.0
 
+# Total GPU ceiling (plan 003): the power limits never add up to more than it, and the
+# governor moves it to the busy cards. A card counts as busy at once (over POWER_IDLE_DRAW_W
+# or POWER_IDLE_UTIL_PCT), and as idle only after ALLOC_IDLE_DWELL_S below both, so a pause
+# between requests doesn't move power around.
+ALLOC_IDLE_DWELL_S = 10.0
+
 # Fail-safe: if the UPS can't be read this many times in a row we are flying blind, so
 # clamp to a conservative per-GPU limit rather than assume headroom.
 POWER_MAX_READ_FAILURES = 3
@@ -240,9 +247,11 @@ SETTING_FILES = {
     "mirror": "fan-mirror",
     "target": "temp-target",
     "ceiling": "power-ceiling",
+    "total": "power-ceiling-total",
 }
-SETTING_NAMES = ("profile", "mirror", "target", "ceiling")
-LOG_PREFIX = {"profile": "FAN", "mirror": "FAN", "target": "TEMP", "ceiling": "POWER"}
+SETTING_NAMES = ("profile", "mirror", "target", "ceiling", "total")
+LOG_PREFIX = {"profile": "FAN", "mirror": "FAN", "target": "TEMP", "ceiling": "POWER",
+              "total": "POWER"}
 RUNTIME_STATE_FILE = "runtime-state.json"
 EFFECTIVE_FILE = "effective.json"
 LOCK_FILE = "daemon.lock"
@@ -343,6 +352,20 @@ def parse_power_ceiling(value: str) -> List[float]:
     return out
 
 
+def parse_power_total(value: str) -> float:
+    """`WATTS` for all GPUs together, or `none`. Returns 0.0 for an explicit `none`."""
+    text = _strip(value)
+    if text in ("", "none", "off", "0"):
+        return 0.0
+    try:
+        watts = float(text)
+    except ValueError:
+        raise ValueError(f"expected watts (one number for all GPUs together), got {text!r}")
+    if watts <= 0:
+        raise ValueError(f"total ceiling must be > 0 W, got {watts:g}")
+    return watts
+
+
 def parse_power_floor_flags(value: str) -> Tuple[str, ...]:
     """Parse a comma-separated, non-empty set of NUT ups.status tokens."""
     flags = tuple(dict.fromkeys(part.strip().upper() for part in value.split(",")
@@ -364,6 +387,8 @@ def _parse_setting(name: str, text: str):
         return parse_mirror(text)
     if name == "target":
         return parse_temp_target(text)
+    if name == "total":
+        return parse_power_total(text) or None
     request = parse_power_ceiling(text)
     return request or None
 
@@ -375,11 +400,13 @@ def format_setting(name: str, value) -> str:
         return "on" if value else "off"
     if name == "target":
         return "none" if value is None else str(value)
+    if name == "total":
+        return "none" if not value else f"{value:g}"
     return "none" if not value else ",".join(f"{w:g}" for w in value)
 
 
 SETTING_DEFAULTS = {"profile": FanProfile(DEFAULT_PROFILE), "mirror": False,
-                    "target": None, "ceiling": None}
+                    "target": None, "ceiling": None, "total": None}
 
 
 def _argtype(parser_fn):
@@ -401,7 +428,7 @@ def _write_atomic(path: str, text: str):
 # ─────────────────────────── SETTINGS ───────────────────────────
 
 class SettingsStore:
-    """Resolves the four live settings from their layers, and notices changes.
+    """Resolves the five live settings from their layers, and notices changes.
 
     Precedence: `cli` (hand-run flags, in memory) > override (run dir) > saved (state dir)
     > default. Files are polled by stat() on every call (cheap), and SIGHUP forces a full
@@ -563,17 +590,28 @@ class PowerGovernor:
       SHRINKING max_w, never by clamping at the decision sites. _set_limit() and every
       control path already bound writes to max_w, so one assignment caps the whole
       actuator surface. Any code that sets a power limit MUST go through _set_limit().
-    - **Temperature target** (operator): observe_thermal() cuts power at target + 2 C
-      for 5 s, stepping by the excess, and releases at target - 2 C for 30 s.
+    - **Total ceiling** (operator, all GPUs together, plan 003): _allocate() splits it
+      between the cards every tick, idle cards at their minimum and the busy ones sharing
+      the rest. It also works by shrinking max_w, so the limits never add up to more than
+      it. A lowered share applies at once; a raised one waits a tick (lower before raise).
+    - **Temperature target** (operator): observe_thermal() cuts power at the target
+      (decisions/009), stepping by the excess, and releases at target - 2 C for 30 s.
     - **Emergency temperature** (host safety): observe_emergency() drops every GPU to its
       hardware minimum after 2 s at the emergency temperature. Always armed.
     - **UPS budget** (host safety, optional): update() keeps TOTAL UPS load under budget
-      by trimming a learned common cap by the measured excess, reacting on the first
+      by trimming the busy cards' caps by the measured excess, reacting on the first
       over-budget tick, and restoring slowly with sustained headroom. With budget_w=None
       there is no UPS at all and the governor holds the ceiling.
 
-    After a thermal or emergency hold is released, power walks back up in POWER_SLEW_UP_W
-    steps every POWER_RESTORE_DWELL_S, never as a jump.
+    **Per-card caps (plan 003).** cap_w[i] is what the UPS budget, the thermal law and the
+    holds allow card i; its limit is max(min_w, min(max_w, cap_w)). A cap is set explicitly
+    by each operation and never re-derived from the applied limits (a shared cap re-derived
+    as min(applied) dragged every card down to the lowest one). Cuts start from the card's
+    current level and never raise it. Raises happen only in the supervised restore and
+    recovery walk, the idle reset, and an allocation raise, which the total bounds.
+
+    After a thermal or emergency hold is released, power walks back up in steps every
+    POWER_RESTORE_DWELL_S, never as a jump.
     """
 
     def __init__(self, handles: List, budget_w: Optional[float] = None,
@@ -605,7 +643,7 @@ class PowerGovernor:
         self._headroom_ticks = 0
         self._last_limit_change = 0.0
         self._idle_since: Optional[float] = None
-        self.learned_cap_w: Optional[float] = None
+        self.cap_w: List[float] = []            # per card: see the class docstring
         self._last_ups_reading: Optional[Tuple[float, Tuple[str, ...]]] = None
         # thermal hold (temperature target)
         self._thermal_hot_since: Optional[float] = None
@@ -628,7 +666,22 @@ class PowerGovernor:
         self.recovery_walk = False
         self.ceiling_request: Optional[List[float]] = None
         self.ceiling_w: Optional[List[float]] = None
+        # total ceiling (plan 003)
+        self.total_w: Optional[float] = None
+        self.alloc_w: Optional[List[float]] = None
+        self._busy: List[bool] = []
+        self._quiet_since: List[Optional[float]] = []
+        self._last_busy_now: Optional[List[bool]] = None
         self._hold_log_pending = True
+
+    @property
+    def learned_cap_w(self) -> Optional[float]:
+        """The highest card's cap (for logs). Setting it sets every card's cap."""
+        return max(self.cap_w) if self.cap_w else None
+
+    @learned_cap_w.setter
+    def learned_cap_w(self, value: Optional[float]):
+        self.cap_w = [] if value is None else [float(value)] * len(self.handles)
 
     # ── setup ──
     def init(self, ceiling_request: Optional[List[float]] = None, source: str = "startup"):
@@ -643,6 +696,8 @@ class PowerGovernor:
             log.info(f"  GPU {i}: power limit range {self.min_w[i]:.0f}-{self.hw_max_w[i]:.0f} W "
                      f"(default {self.default_w[i]:.0f} W, now {self.applied_w[i]:.0f} W)")
         self.max_w = list(self.hw_max_w)
+        self._busy = [True] * len(self.handles)          # assume busy until measured
+        self._quiet_since = [None] * len(self.handles)
 
         dry = "  [DRY RUN — nothing will be set]" if self.dry_run else ""
         if self.budget_w is None:
@@ -651,8 +706,8 @@ class PowerGovernor:
             log.info(f"Power budget: {self.budget_w:.0f} W total UPS load (read-only input)" + dry)
             log.info("Immediate power-floor UPS flags: " + ",".join(self.floor_on_flags))
 
-        # Applied BEFORE learned_cap_w is seeded, so the learned common cap starts at the
-        # ceiling rather than at the pre-ceiling hardware limit. NVML limits reset to the
+        # Applied BEFORE the caps are seeded, so they start at the ceiling rather than at
+        # the pre-ceiling hardware limit. NVML limits reset to the
         # card default at boot, so this is also how a ceiling survives a reboot.
         if ceiling_request is not None:
             self.apply_ceiling(ceiling_request, source)
@@ -665,10 +720,45 @@ class PowerGovernor:
             log.info(f"  note: --power-fallback {self.fallback_w:.0f} W sits above the "
                      "ceiling and will be clamped to it when the UPS is unreadable")
 
-        self.learned_cap_w = min(self.applied_w) if self.applied_w else None
+        # each card starts from where it is and walks up under supervision
+        self.cap_w = list(self.applied_w)
         self._last_limit_change = time.monotonic()
         if self.budget_w is None:
             self._hold_ceiling()
+
+    # ── bounds ──
+    def _ceil_w(self, i: int) -> float:
+        """Card i's own upper bound, before the total's share: its ceiling or hardware max."""
+        return self.ceiling_w[i] if self.ceiling_w is not None else self.hw_max_w[i]
+
+    def _base_w(self, i: int) -> float:
+        """Where card i's cap settles when nothing holds it down: its ceiling; with no
+        ceiling, its hardware max, or its default when there is no UPS budget either."""
+        if self.ceiling_w is None and self.budget_w is None:
+            return self.default_w[i]
+        return self._ceil_w(i)
+
+    def _recompute_max_w(self):
+        self.max_w = [min(self._ceil_w(i), self.alloc_w[i]) if self.alloc_w is not None
+                      else self._ceil_w(i) for i in range(len(self.handles))]
+
+    def _limit_for(self, i: int) -> float:
+        """The limit card i should sit at, given its bounds and its cap."""
+        return max(self.min_w[i], min(self.max_w[i], self.cap_w[i]))
+
+    def _cut_base(self, i: int) -> float:
+        """The level a cut on card i starts from: its current level, except for an IDLE
+        card held down only by its share of the total. That card's cap is cut instead, so
+        the cut doesn't record its idle share as a limit of its own. Otherwise it would be
+        stuck at 150 W when it wakes up and crawl back +20 W per 30 s (seen on pve-ai)."""
+        if (self.alloc_w is not None and not self._busy[i]
+                and self.max_w[i] < self.cap_w[i] - 0.5):
+            return self.cap_w[i]
+        return min(self.applied_w[i], self.cap_w[i])
+
+    def _lower_to(self, i: int, watts: float):
+        """A cut: set card i to `watts` or leave it where it is if that's lower."""
+        self._set_limit(i, min(self.applied_w[i], watts))
 
     # ── the ceiling ──
     def apply_ceiling(self, request: Optional[List[float]], source: str):
@@ -679,7 +769,7 @@ class PowerGovernor:
                 return
             self.ceiling_request = None
             self.ceiling_w = None
-            self.max_w = list(self.hw_max_w)
+            self._recompute_max_w()
             self._hold_log_pending = True
             log.info(f"POWER: ceiling cleared ({source}) — upper limit back to hardware max "
                      + "/".join(f"{w:.0f}" for w in self.hw_max_w) + " W")
@@ -710,7 +800,7 @@ class PowerGovernor:
 
         self.ceiling_request = list(request)
         self.ceiling_w = effective
-        self.max_w = list(effective)
+        self._recompute_max_w()
         self._hold_log_pending = True
         log.info("POWER: ceiling set to " + "/".join(f"{w:.0f}" for w in effective)
                  + f" W per GPU ({source}; hardware max "
@@ -721,8 +811,11 @@ class PowerGovernor:
         for i in range(n):
             if self.applied_w[i] > self.max_w[i] + 0.5:
                 self._set_limit(i, self.max_w[i])
-        if self.learned_cap_w is not None:
-            self.learned_cap_w = min(self.learned_cap_w, min(self.max_w))
+        if self.cap_w:
+            # a raised ceiling is walked up to, under supervision: the cap stays below it
+            self.cap_w = [min(c, self._ceil_w(i)) for i, c in enumerate(self.cap_w)]
+        if self.total_w is not None:
+            self._allocate(time.monotonic(), refresh=False)
         if self.budget_w is None:
             self._hold_ceiling()
 
@@ -739,71 +832,70 @@ class PowerGovernor:
         for i in range(len(self.handles)):
             if abs(self.applied_w[i] - self.default_w[i]) >= 1.0:
                 self._set_limit(i, self.default_w[i])
-        if self.applied_w:
-            self.learned_cap_w = min(self.applied_w)
+        self.cap_w = list(self.default_w)
         log.info(f"POWER: no ceiling and no UPS budget ({source}) — GPUs at their "
                  "default limit " + "/".join(f"{w:.0f}" for w in self.applied_w) + "W")
 
-    def raise_step_w(self) -> float:
-        """How much one upward step may add: exponential in degrees below the release point."""
+    def raise_step_w(self, level_w: Optional[float] = None) -> float:
+        """How much one upward step may add to a card at `level_w`: exponential in degrees
+        below the release point, at most THERMAL_POWER_MAX_STEP_FRACTION of its level."""
+        if level_w is None:
+            level_w = self.learned_cap_w
         if (self._conservative_recovery or self._target_c is None
-                or self._last_hottest_c is None or self.learned_cap_w is None):
+                or self._last_hottest_c is None or level_w is None):
             return POWER_SLEW_UP_W
         below_c = (self._target_c - THERMAL_POWER_RECOVER_MARGIN_C) - self._last_hottest_c
         if below_c <= 0:
             return POWER_SLEW_UP_W
         step = POWER_SLEW_UP_W * (2 ** min(below_c, 16))
-        return max(POWER_SLEW_UP_W, min(step, THERMAL_POWER_MAX_STEP_FRACTION * self.learned_cap_w))
+        return max(POWER_SLEW_UP_W, min(step, THERMAL_POWER_MAX_STEP_FRACTION * level_w))
 
     def _walk_step(self, now: float) -> bool:
-        """One recovery-walk step towards the walk target. Returns True when it's done."""
-        if self.learned_cap_w is None:
+        """One recovery-walk step: each card's cap towards its base. True when done."""
+        if not self.cap_w:
             return True
-        top = min(self._walk_targets())
-        if self.learned_cap_w >= top - 0.5:
+        n = len(self.handles)
+        if all(self.cap_w[i] >= self._base_w(i) - 0.5 for i in range(n)):
             return True
         if now - self._last_limit_change < POWER_RESTORE_DWELL_S:
             return False
-        step = self.raise_step_w()
-        self.learned_cap_w = min(top, self.learned_cap_w + step)
-        for i in range(len(self.handles)):
-            self._set_limit(i, min(self._walk_targets()[i], self.learned_cap_w))
+        steps = []
+        for i in range(n):
+            if self.cap_w[i] >= self._base_w(i) - 0.5:
+                continue
+            step = self.raise_step_w(self.cap_w[i])
+            steps.append(step)
+            self.cap_w[i] = min(self._base_w(i), self.cap_w[i] + step)
+            self._set_limit(i, self._limit_for(i))
         self._last_limit_change = now
-        log.info(f"POWER: recovering after a hold, +{step:.0f} W -> "
+        log.info(f"POWER: recovering after a hold, +{max(steps):.0f} W -> "
                  + "/".join(f"{w:.0f}" for w in self.applied_w) + "W")
-        done = self.learned_cap_w >= top - 0.5
+        done = all(self.cap_w[i] >= self._base_w(i) - 0.5 for i in range(n))
         if done:
             self._conservative_recovery = False
         return done
 
-    def _walk_targets(self) -> List[float]:
-        if self.ceiling_w is not None:
-            return list(self.ceiling_w)
-        if self.budget_w is None:
-            return list(self.default_w)
-        return list(self.max_w)
-
     def _hold_ceiling(self):
         """No UPS budget: park every GPU on its cap. Idempotent; logs on change."""
         now = time.monotonic()
+        n = len(self.handles)
         if self.emergency_active or self.blind_active:
             targets = list(self.min_w)
-        elif self.thermal_limited and self.learned_cap_w is not None:
-            targets = [min(t, self.learned_cap_w) for t in self._walk_targets()]
+        elif self.thermal_limited and self.cap_w:
+            targets = [self._limit_for(i) for i in range(n)]
         elif self.recovery_walk:
             if self._walk_step(now):
                 self.recovery_walk = False
                 log.info("POWER: recovery complete")
             return
-        elif self.ceiling_w is not None:
-            targets = list(self.ceiling_w)
+        elif self.ceiling_w is not None or self.total_w is not None:
+            self.cap_w = [self._base_w(i) for i in range(n)]
+            targets = [self._limit_for(i) for i in range(n)]
         else:
             return
         before = tuple(self.applied_w)
-        for i in range(len(self.handles)):
+        for i in range(n):
             self._set_limit(i, targets[i])
-        if self.applied_w:
-            self.learned_cap_w = min(self.applied_w)
         if tuple(self.applied_w) != before or self._hold_log_pending:
             log.info("POWER: holding (no UPS budget), limits "
                      + "/".join(f"{w:.0f}" for w in self.applied_w) + "W"
@@ -818,7 +910,7 @@ class PowerGovernor:
         there" early-return is blind to anyone else moving the limit. A ceiling is a
         guarantee, so re-read the hardware and correct upward violations.
         """
-        if self.ceiling_w is None or self.dry_run:
+        if (self.ceiling_w is None and self.alloc_w is None) or self.dry_run:
             return
         for i, h in enumerate(self.handles):
             try:
@@ -827,8 +919,9 @@ class PowerGovernor:
                 log.error(f"GPU {i}: power limit read failed: {e}")
                 continue
             if actual > self.max_w[i] + 0.5:
-                log.warning(f"⚠ POWER: GPU {i} limit is {actual:.0f} W, above the "
-                            f"{self.max_w[i]:.0f} W ceiling — changed out of band; re-applying")
+                bound = "share of the total" if self.max_w[i] < self._ceil_w(i) - 0.5 else "ceiling"
+                log.warning(f"⚠ POWER: GPU {i} limit is {actual:.0f} W, above its "
+                            f"{self.max_w[i]:.0f} W {bound} — changed out of band; re-applying")
                 self.applied_w[i] = actual
                 self._set_limit(i, self.max_w[i])
 
@@ -850,16 +943,16 @@ class PowerGovernor:
         log.warning(f"⚠ POWER: clamping all GPUs to {watts:.0f} W — {reason}")
         for i in range(len(self.handles)):
             self._set_limit(i, watts)
-        self.learned_cap_w = min(self.applied_w) if self.applied_w else None
+        self.cap_w = [max(self.min_w[i], min(self._ceil_w(i), watts))
+                      for i in range(len(self.handles))]
         self._last_limit_change = time.monotonic()
         self._headroom_ticks = 0
         self._idle_since = None
 
-    def _read_gpu_power_and_activity(self) -> Optional[Tuple[float, int]]:
-        """Aggregate board draw and a conservative active-GPU count (a failed read counts
-        as active: safer to keep a learned cap than reset to hardware max blind)."""
-        total_draw = 0.0
-        active_count = 0
+    def _read_activity(self) -> Optional[Tuple[List[float], List[bool]]]:
+        """Per card: board draw, and whether it's busy right now. None if any read fails."""
+        draws: List[float] = []
+        busy: List[bool] = []
         for i, h in enumerate(self.handles):
             try:
                 draw_w = pynvml.nvmlDeviceGetPowerUsage(h) / 1000.0
@@ -867,10 +960,156 @@ class PowerGovernor:
             except pynvml.NVMLError as e:
                 log.error(f"GPU {i}: power/utilization read failed: {e}")
                 return None
-            total_draw += draw_w
-            if draw_w > POWER_IDLE_DRAW_W or util_pct > POWER_IDLE_UTIL_PCT:
-                active_count += 1
-        return total_draw, active_count
+            draws.append(draw_w)
+            busy.append(draw_w > POWER_IDLE_DRAW_W or util_pct > POWER_IDLE_UTIL_PCT)
+        return draws, busy
+
+    def _read_gpu_power_and_activity(self) -> Optional[Tuple[float, int]]:
+        """Aggregate board draw and a conservative active-GPU count (a failed read counts
+        as active: safer to keep a learned cap than reset to hardware max blind)."""
+        reading = self._read_activity()
+        if reading is None:
+            self._last_busy_now = None
+            return None
+        draws, busy = reading
+        self._last_busy_now = busy
+        return sum(draws), sum(busy)
+
+    # ── the total ceiling (plan 003) ──
+    def apply_total(self, total: Optional[float], source: str):
+        """Make `total` (W, all GPUs together) the active total ceiling. None removes it."""
+        n = len(self.handles)
+        if total is None:
+            if self.total_w is None:
+                return
+            self.total_w = None
+            self.alloc_w = None
+            self._recompute_max_w()
+            self._hold_log_pending = True
+            log.info(f"POWER: total ceiling cleared ({source}) — each GPU bounded by its own "
+                     "ceiling only")
+            if self.budget_w is None:
+                self._hold_ceiling()
+            return
+        floor = sum(self.min_w)
+        if total < floor - 0.5:
+            log.error(f"POWER: ignoring total ceiling {total:g} W from {source} — below the "
+                      f"{floor:.0f} W the GPUs need at their minimum; keeping "
+                      + (f"{self.total_w:g} W" if self.total_w is not None else "no total"))
+            return
+        if self.total_w is not None and abs(total - self.total_w) < 0.5:
+            return
+        self.total_w = float(total)
+        self._hold_log_pending = True
+        top = sum(self._ceil_w(i) for i in range(n))
+        note = (f"; above the {top:.0f} W sum of the GPUs' ceilings, so it doesn't bind"
+                if total >= top - 0.5 else "")
+        log.info(f"POWER: total ceiling set to {total:g} W across {n} GPU(s) ({source}); "
+                 f"idle GPUs at their minimum, the busy ones share the rest{note}")
+        self._allocate(time.monotonic(), refresh=True)
+        if self.budget_w is None:
+            self._hold_ceiling()
+
+    def settle_after_start(self):
+        """With a total and no hold to restore, start every card at its full share.
+
+        The caps normally start from the cards' current limits, so a restart walks up under
+        supervision. With a total, those limits are just the previous run's shares, and the
+        total already bounds what the cards can draw, so a busy card needn't crawl back.
+        """
+        if (self.total_w is None or not self.cap_w or self._holding()
+                or self._was_power_floor):
+            return
+        self.cap_w = [self._ceil_w(i) for i in range(len(self.handles))]
+        for i in range(len(self.handles)):
+            self._set_limit(i, self._limit_for(i))
+
+    def _shares(self, busy: List[bool]) -> List[float]:
+        """Split the total: idle cards at their minimum, the busy ones water-filled up to
+        their own ceiling. All busy or all idle: everyone shares."""
+        n = len(self.handles)
+        sharers = [i for i in range(n) if busy[i]]
+        if not sharers or len(sharers) == n:
+            sharers = list(range(n))
+        shares = list(self.min_w)
+        amount = self.total_w - sum(self.min_w[i] for i in range(n) if i not in sharers)
+        lows = [self.min_w[i] for i in sharers]
+        highs = [max(self.min_w[i], self._ceil_w(i)) for i in sharers]
+
+        def filled(level: float) -> float:
+            return sum(min(h, max(lo, level)) for lo, h in zip(lows, highs))
+
+        lo_level, hi_level = 0.0, max(highs)
+        if filled(hi_level) <= amount:
+            level = hi_level
+        else:
+            for _ in range(60):
+                mid = (lo_level + hi_level) / 2
+                if filled(mid) <= amount:
+                    lo_level = mid
+                else:
+                    hi_level = mid
+            level = lo_level
+        for k, i in enumerate(sharers):
+            shares[i] = float(int(min(highs[k], max(lows[k], level))))   # whole watts, rounded down
+        return shares
+
+    def _note_activity(self, busy_now: List[bool], now: float):
+        """Busy at once; idle only after ALLOC_IDLE_DWELL_S. An unreadable card is busy."""
+        for i in range(len(self.handles)):
+            if busy_now[i]:
+                self._busy[i] = True
+                self._quiet_since[i] = None
+            elif self._busy[i]:
+                if self._quiet_since[i] is None:
+                    self._quiet_since[i] = now
+                elif now - self._quiet_since[i] >= ALLOC_IDLE_DWELL_S:
+                    self._busy[i] = False
+                    self._quiet_since[i] = None
+
+    def _refresh_busy(self, now: float):
+        """Before a cut: a card that just started working must count as busy in THIS tick,
+        or the cut would trim its cap instead of the power it's drawing (seen on pve-ai)."""
+        if self.total_w is None:
+            return
+        reading = self._read_activity()
+        self._note_activity(reading[1] if reading is not None else [True] * len(self.handles),
+                            now)
+
+    def _allocate(self, now: float, refresh: bool = True):
+        """Move the total to the busy cards. Lower before raise: in a tick that lowers any
+        card's share, raises wait for the next tick, so the limits never add up to more
+        than the total, even while a card is still obeying a lower limit."""
+        if self.total_w is None or not self.handles:
+            return
+        n = len(self.handles)
+        if refresh:
+            reading = self._read_activity()
+            self._note_activity(reading[1] if reading is not None else [True] * n, now)
+        want = self._shares(self._busy)
+        old = self.alloc_w if self.alloc_w is not None else list(self.max_w)
+        lowering = [i for i in range(n) if want[i] < old[i] - 0.5]
+        raising = [i for i in range(n) if want[i] > old[i] + 0.5]
+        if lowering:
+            new = [want[i] if i in lowering else old[i] for i in range(n)]
+            raising = []
+        else:
+            new = want
+        if self.alloc_w is not None and not lowering and not raising:
+            return
+        self.alloc_w = new
+        self._recompute_max_w()
+        for i in lowering:
+            self._lower_to(i, self.max_w[i])
+        if raising and not (self.emergency_active or self.blind_active or self._was_power_floor):
+            for i in raising:
+                if self.cap_w:
+                    self._set_limit(i, self._limit_for(i))
+        log.info(f"POWER: total {self.total_w:g} W -> "
+                 + " / ".join(f"GPU {i} {new[i]:.0f} W ({'busy' if self._busy[i] else 'idle'})"
+                              for i in range(n))
+                 + (" (raises next tick)" if lowering and any(want[i] > old[i] + 0.5
+                                                               for i in range(n)) else ""))
 
     # ── temperature ──
     def observe_emergency(self, hottest_c: int, emergency_c: int):
@@ -940,7 +1179,7 @@ class PowerGovernor:
         self._recent_c = (self._recent_c + [hottest_c])[-3:]
         rise_c = hottest_c - self._recent_c[-2] if len(self._recent_c) >= 2 else 0
         climbing = len(self._recent_c) >= 3 and hottest_c > self._recent_c[-3]
-        if self.learned_cap_w is None or not self.min_w or self.emergency_active:
+        if not self.cap_w or not self.min_w or self.emergency_active:
             return
         if target_c is None:
             if self.thermal_limited:
@@ -985,13 +1224,16 @@ class PowerGovernor:
             elif hot_for < THERMAL_POWER_INITIAL_DWELL_S and not no_grace:
                 return
             before = tuple(self.applied_w)
+            # every card is cut from its own level (shared airflow), and never raised
+            self._refresh_busy(now)
+            levels = [self._cut_base(i) for i in range(len(self.handles))]
             step_w = max(THERMAL_POWER_MIN_STEP_W,
                          min(THERMAL_POWER_MIN_STEP_W * (2 ** excess_c),
-                             THERMAL_POWER_MAX_STEP_FRACTION * self.learned_cap_w))
-            new_cap = max(min(self.min_w), self.learned_cap_w - step_w)
-            self.learned_cap_w = new_cap
+                             THERMAL_POWER_MAX_STEP_FRACTION * max(levels)))
             for i in range(len(self.handles)):
-                self._set_limit(i, new_cap)
+                cut = min(step_w, THERMAL_POWER_MAX_STEP_FRACTION * levels[i])
+                self.cap_w[i] = max(self.min_w[i], levels[i] - max(THERMAL_POWER_MIN_STEP_W, cut))
+                self._lower_to(i, self._limit_for(i))
             self.thermal_limited = True
             self.recovery_walk = False
             self._thermal_hot_since = now
@@ -1009,8 +1251,10 @@ class PowerGovernor:
                    else "still climbing, no grace" if climbing and hot_for < 1.0
                    else f"for {hot_for:.0f}s")
             log.warning(f"⚠ THERMAL: {hottest_c}C{fans}, {why} (target {target_c}C, "
-                        f"+{excess_c}C over) -> -{step_w:.0f} W, power cap {new_cap:.0f} W")
-            if new_cap <= min(self.min_w) + 0.5 and hottest_c >= trigger_c:
+                        f"+{excess_c}C over) -> -{step_w:.0f} W, power cap "
+                        + "/".join(f"{w:.0f}" for w in self.applied_w) + " W")
+            if (all(c <= lo + 0.5 for c, lo in zip(self.cap_w, self.min_w))
+                    and hottest_c >= trigger_c):
                 log.warning("⚠ THERMAL: already at the hardware power floor and still over the "
                             "target — only the fan profile or the card's own limits can help now")
             return
@@ -1077,6 +1321,8 @@ class PowerGovernor:
     # ── the UPS loop ──
     def update(self, force: bool = False):
         now = time.monotonic()
+        # the total is moved every fan tick from NVML (no lag), not on the UPS interval
+        self._allocate(now)
         if not force and (now - self._last_run) < self.interval:
             return
         self._last_run = now
@@ -1161,11 +1407,11 @@ class PowerGovernor:
                         log.info("POWER: recovery complete")
                     return
                 changed = False
+                self.cap_w = [self._ceil_w(i) for i in range(len(self.handles))]
                 for i in range(len(self.handles)):
-                    if abs(self.applied_w[i] - self.max_w[i]) >= 1.0:
-                        self._set_limit(i, self.max_w[i])
+                    if abs(self.applied_w[i] - self._limit_for(i)) >= 1.0:
+                        self._set_limit(i, self._limit_for(i))
                         changed = True
-                self.learned_cap_w = min(self.applied_w) if self.applied_w else None
                 self._thermal_hot_since = None
                 self._thermal_cool_since = None
                 if changed:
@@ -1180,8 +1426,12 @@ class PowerGovernor:
             return
         self._idle_since = None
 
-        if self.learned_cap_w is None:
-            self.learned_cap_w = min(self.applied_w)
+        if not self.cap_w:
+            self.cap_w = list(self.applied_w)
+        n = len(self.handles)
+        if self.total_w is not None and self._last_busy_now is not None:
+            self._note_activity(self._last_busy_now, now)
+        levels = [self._cut_base(i) for i in range(n)]
 
         over = total_w - self.budget_w
         if over > POWER_DEADBAND_W:
@@ -1193,18 +1443,22 @@ class PowerGovernor:
                          "letting it pass, limits held "
                          + "/".join(f"{w:.0f}" for w in self.applied_w) + "W")
                 return
-            target = self.learned_cap_w - (over / active_gpu_count)
+            # as before: every card is cut by the excess over the busy count (the idle ones
+            # too, so a card that wakes up doesn't start above the trim), each from its own
+            # level rather than from one shared cap
+            cut_w = min(over / active_gpu_count, POWER_SLEW_DOWN_W)
+            targets = [max(self.min_w[i], levels[i] - cut_w) for i in range(n)]
+            raise_w = 0.0
             mode = "throttle"
         else:
             self._over_ticks = 0
-            max_common_cap = min(self.max_w)
             if total_w >= self.budget_w - POWER_RESTORE_MARGIN_W:
                 self._headroom_ticks = 0
                 log.info(f"POWER: ups={total_w:.0f}W gpu={gpu_draw:.0f}W other={non_gpu:.0f}W "
                          f"budget={self.budget_w:.0f}W -> learned ceiling steady, limits held "
                          + "/".join(f"{w:.0f}" for w in self.applied_w) + "W")
                 return
-            if self.learned_cap_w >= max_common_cap:
+            if all(self.cap_w[i] >= self._ceil_w(i) - 0.5 for i in range(n)):
                 self._headroom_ticks = 0
                 self.recovery_walk = False
                 self._conservative_recovery = False
@@ -1231,34 +1485,36 @@ class PowerGovernor:
             headroom_w = (self.budget_w - POWER_RESTORE_MARGIN_W) - total_w
             if self.recovery_walk:
                 # recovering after a thermal hold: the exponential step, bounded by headroom
-                raise_w = max(POWER_SLEW_UP_W, min(self.raise_step_w(),
+                raise_w = max(POWER_SLEW_UP_W, min(self.raise_step_w(max(levels)),
                                                    headroom_w / max(1, active_gpu_count)))
             else:
                 raise_w = POWER_SLEW_UP_W       # a UPS-budget trim restores slowly (#2)
-            target = min(max_common_cap, self.learned_cap_w + raise_w)
+            # each card below its own bound raises its cap by the step
+            targets = [min(self._ceil_w(i), self.cap_w[i] + raise_w)
+                       if self.cap_w[i] < self._ceil_w(i) - 0.5 else self.cap_w[i]
+                       for i in range(n)]
             self._headroom_ticks = 0
             mode = "restore"
 
         limits_before = tuple(self.applied_w)
-        for i in range(len(self.handles)):
+        for i in range(n):
             cur = self.applied_w[i]
-            want = max(self.min_w[i], min(self.max_w[i], target))
+            want = max(self.min_w[i], min(self.max_w[i], targets[i]))
             delta = want - cur
-            if abs(delta) < POWER_DEADBAND_W:
-                if mode == "throttle" and delta < 0:
-                    self._set_limit(i, want)
-                    continue
-                if mode == "restore" and delta > 0 and want == self.max_w[i]:
-                    self._set_limit(i, want)
+            if mode == "throttle":
+                if targets[i] < levels[i] - 0.5:
+                    self.cap_w[i] = targets[i]
+                    self._lower_to(i, want)
                 continue
-            if delta < 0:
-                want = cur - min(-delta, POWER_SLEW_DOWN_W)
-            else:
-                want = cur + min(delta, raise_w if mode == "restore" else POWER_SLEW_UP_W)
-            self._set_limit(i, want)
+            # restore: the cap moves by the step; the limit follows within the card's bound
+            if targets[i] > self.cap_w[i] + 0.5:
+                if (abs(delta) < POWER_DEADBAND_W and want < self.max_w[i]
+                        and targets[i] < self._ceil_w(i) - 0.5):
+                    continue            # too small to bother, and not the last step
+                self.cap_w[i] = targets[i]
+                self._set_limit(i, self._limit_for(i))
 
         if tuple(self.applied_w) != limits_before:
-            self.learned_cap_w = min(self.applied_w)
             self._last_limit_change = now
             if mode == "throttle":
                 # the budget binds now: any further restore is a UPS restore, +20 W (#2)
@@ -1273,7 +1529,8 @@ class PowerGovernor:
                          f"(timeout {POWER_FEEDBACK_TIMEOUT_S:.0f}s)")
 
         log.info(f"POWER: ups={total_w:.0f}W gpu={gpu_draw:.0f}W other={non_gpu:.0f}W "
-                 f"budget={self.budget_w:.0f}W -> {mode}, learned-cap={self.learned_cap_w:.0f}W "
+                 f"budget={self.budget_w:.0f}W -> {mode}, caps="
+                 + "/".join(f"{w:.0f}" for w in self.cap_w) + "W "
                  + "/".join(f"{w:.0f}" for w in self.applied_w) + "W")
 
     def restore_defaults(self):
@@ -1369,6 +1626,7 @@ class FanController:
         self.governor.init(ceiling, describe_source(self.store, "ceiling", csource))
         self._apply([c for c in changes if c[0] != "ceiling"], [], startup=True)
         self._restore_runtime_state()
+        self.governor.settle_after_start()
         self._write_effective()
 
     # ── settings ──
@@ -1382,7 +1640,8 @@ class FanController:
             text = value.describe() if name == "profile" else format_setting(name, value)
             live, _ = self.store.resolve(name)
             what = {"profile": "FAN: profile", "mirror": "FAN: mirror",
-                    "target": "TEMP: target", "ceiling": "POWER: ceiling"}[name]
+                    "target": "TEMP: target", "ceiling": "POWER: ceiling",
+                    "total": "POWER: total ceiling"}[name]
             if source == "override":
                 hidden = (f"masked until restart by a temporary override "
                           f"({format_setting(name, live)})")
@@ -1393,6 +1652,9 @@ class FanController:
         if "ceiling" in by_name:
             value, source = by_name["ceiling"]
             self.governor.apply_ceiling(value, describe_source(self.store, "ceiling", source))
+        if "total" in by_name:
+            value, source = by_name["total"]
+            self.governor.apply_total(value, describe_source(self.store, "total", source))
         if "target" in by_name:
             value, source = by_name["target"]
             self._set_target(value, describe_source(self.store, "target", source))
@@ -1769,12 +2031,15 @@ class FanController:
             "settings": settings,
             "in_force": {"profile": self.profile.text(), "mirror": "on" if self.mirror else "off",
                          "target": format_setting("target", self.target),
-                         "ceiling": format_setting("ceiling", self.governor.ceiling_request)},
+                         "ceiling": format_setting("ceiling", self.governor.ceiling_request),
+                         "total": format_setting("total", self.governor.total_w)},
             "emergency_c": self.emergency_c,
             "holds": {"thermal": self.governor.thermal_limited,
                       "emergency": self.governor.emergency_active,
                       "recovering": self.governor.recovery_walk},
             "power_limits_w": [round(w) for w in self.governor.applied_w],
+            "total_shares_w": ([round(w) for w in self.governor.alloc_w]
+                               if self.governor.alloc_w is not None else None),
             "temps_c": [self.last_temps.get(g) for g in range(len(self.handles))],
             "fan_pct": self.last_fan_pct,
             "adaptive_trim_pct": (round(self._target_trim_pct, 1)
@@ -1985,10 +2250,14 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Mirror off: each card follows its own temperature")
     live.add_argument("--temp-target", type=_argtype(parse_temp_target), metavar="C",
                       default=argparse.SUPPRESS,
-                      help="Temperature target in C, or 'none'. Power is cut at target+2C held for "
-                           "5s. Given without --mode, implies --mode adaptive (the old behaviour)")
+                      help="Temperature target in C, or 'none'. Power is cut at the target (a 5s "
+                           "grace while steady). Given without --mode, implies --mode adaptive "
+                           "(the old behaviour)")
     live.add_argument("--power-ceiling", type=_argtype(parse_power_ceiling), metavar="WATTS",
                       help="Per-GPU power ceiling: W, W,W, or 'none'")
+    live.add_argument("--power-ceiling-total", type=_argtype(parse_power_total), metavar="WATTS",
+                      help="Total power ceiling for all GPUs together, moved to the busy cards: "
+                           "W, or 'none'")
 
     safety = parser.add_argument_group("safety limits (set by the deployment)")
     safety.add_argument("--temp-emergency", type=int, default=DEFAULT_TEMP_EMERGENCY_C, metavar="C",
@@ -2039,6 +2308,8 @@ def cli_settings(args) -> Dict[str, object]:
             cli["profile"] = FanProfile("adaptive")     # legacy: --temp-target meant adaptive
     if args.power_ceiling is not None:
         cli["ceiling"] = args.power_ceiling or None
+    if args.power_ceiling_total is not None:
+        cli["total"] = args.power_ceiling_total or None
     return cli
 
 

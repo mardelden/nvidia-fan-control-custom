@@ -29,6 +29,7 @@ other.
 | `fan-mirror` | `on` `off` | `off` |
 | `temp-target` | °C, or `none` | no target |
 | `power-ceiling` | `W`, `W,W`, or `none` | the hardware max |
+| `power-ceiling-total` | `W` (all GPUs together), or `none` | no total |
 
 Changes are picked up live (≤ 2 s; `systemctl reload` re-reads at once), and each one is
 acknowledged in the journal with a line starting `FAN:`, `TEMP:` or `POWER:`. **A line
@@ -93,6 +94,7 @@ or target is acknowledged as *masked by a command-line flag*.
 | A card's temperature unreadable in 3 of the last 5 readings | Blind: every GPU to its minimum power, owned fans 100% (`native` left alone); released after 30 s of good readings, +20 W steps. A single missed reading counts at the last known temperature |
 | UPS status matches `--power-floor-on` | Every GPU to its hardware floor, immediately |
 | UPS unreadable 3× | Clamp to `--power-fallback` (never raising a card that's in a hold) |
+| Total ceiling set | Idle cards at their minimum, the busy ones share the rest, lowered before raised; the sum of limits never exceeds it |
 | Total UPS load > budget | Trim the shared cap by the measured excess; restore slowly (+20 W). Only a thermal-hold recovery raises faster, bounded by headroom, and it waits for a fresh UPS sample |
 | Service stops cleanly | Fans → factory curve. Power is **never raised**: the ceiling, holds, the on-battery floor, budget trims and an out-of-band `nvidia-smi -pl` lower all stay until the next start |
 | Service crashes | Fans stay where they were unless `ExecStopPost=--reset-fans` runs (see above) |
@@ -122,9 +124,12 @@ python3 /opt/nvidia-fan-control/nvidia-fan-control.py --clear-override
 - **Raising a limit is supervised.** Lowering is immediate. After a hold, power returns every
   30 s in exponential steps (+20 W just under the line, up to +50% when clearly cool); after an
   emergency or blind hold, +20 W steps.
-- **Keep per-GPU ceilings equal** (`300`, not `600,300`) until the per-card cap exists. Today
-  the first cut would drop the higher card to the lower one's level. `gpu-ceiling-set`
-  accepts `W,W`, so it's worth refusing unequal values there for now.
+- **Per-GPU ceilings may differ** since plan 003 (per-card caps), so `gpu-ceiling-set` no
+  longer needs to refuse unequal values.
+- **The total ceiling is the ramp bound; the ceiling is per card.** To give one card 600 W
+  safely, set the **total first** (e.g. 750), then raise the ceiling (600). The other order
+  leaves 600/600 with no total for a moment. With a total, an idle card sits at 150 W, and it
+  stays there after a stop until the next start.
 - **`--power-dry-run` is power-only** (fans and the emergency still run); `--dry-run` touches
   nothing at all.
 - **The thermal cut is a shared cap**, so every card drops when the hottest card is over.
