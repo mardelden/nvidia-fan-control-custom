@@ -2266,10 +2266,11 @@ class FanController:
                                        + TRIM_FLOOR_RAISE_PCT * (holds - self._seen_holds))
             self._seen_holds = holds
             self._floor_changed_at = now
-            log.info(f"FAN: adaptive unlearns after a power cut for heat: quiet trim floor "
-                     f"{before:+.0f}% -> {self._trim_floor_pct:+.0f}%"
-                     + (" (the fans now follow the base curve)"
-                        if self._trim_floor_pct >= 0.0 else ""))
+            if self._trim_floor_pct != before:      # at 0 already: nothing new to say
+                log.info(f"FAN: adaptive unlearns after a power cut for heat: quiet trim floor "
+                         f"{before:+.0f}% -> {self._trim_floor_pct:+.0f}%"
+                         + (" (the fans now follow the base curve)"
+                            if self._trim_floor_pct >= 0.0 else ""))
         elif (self._trim_floor_pct > TARGET_TRIM_MIN_PCT
               and now - self._floor_changed_at >= TRIM_FLOOR_RELAX_S):
             before = self._trim_floor_pct
