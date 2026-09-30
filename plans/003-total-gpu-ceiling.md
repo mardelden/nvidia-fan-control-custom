@@ -157,3 +157,24 @@ Tests: 189 + 23. Each fix has a replay test that fails without it.
 
 **Not tested on hardware:** both cards busy under a 750 W total. That's ~1,050 W at the wall
 until the UPS budget trims, and it was deliberately not provoked.
+
+## Addendum: the thermal cut per card (operator, 2026-09-29)
+
+**Operator:** with a total, cutting every card when one is hot wastes budget. So cut only the
+hot card, and let the cooler busy cards use what it frees, still within the total.
+
+- **The cut applies only to the hot card(s).** The law, its timings and its state still run
+  on the hottest card (decisions/009). The cards cut are those at or over the target, plus
+  the hottest one for a predictive cut. `_hot_cards`.
+- **The unused share goes to the others.** The allocator's water-fill caps each busy card at
+  `min(ceiling, cap)`, so a card capped below its fair share leaves the rest to the others.
+  Lower before raise still holds.
+- **Unchanged:** the 92 °C emergency (host-wide), and the UPS budget (every card).
+- **The accepted trade-off:** back to back, GPU0's exhaust heats GPU1, so feeding GPU0 more
+  pushes GPU1 down. The 92 °C emergency is the backstop.
+
+Hardware (pve-ai, 17:16): both cards burning, total 600, target 62, fans at max. GPU1 reached
+62 °C and **only GPU1 was cut** (300 → 270 → 240 W). GPU0 took the freed share a tick later
+(330 → 360 W), with the sum at exactly 600 W. When GPU0 reached 62 °C in turn, only GPU0 was
+cut. The coupling is visible: with GPU0 at 300–360 W, GPU1 held 61–62 °C even at 180 W. It
+was at 63–64 °C at 300 W alone. Tests: 195 + 23.

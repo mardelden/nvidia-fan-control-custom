@@ -746,6 +746,16 @@ class PowerGovernor:
         """The limit card i should sit at, given its bounds and its cap."""
         return max(self.min_w[i], min(self.max_w[i], self.cap_w[i]))
 
+    def _hot_cards(self, temps: Optional[Dict[int, int]], trigger_c: int) -> List[int]:
+        """The cards a thermal cut applies to: every card at or over the cut point, and the
+        hottest one (a predictive cut comes before it's over). Without per-card
+        temperatures, every card."""
+        n = len(self.handles)
+        if not temps:
+            return list(range(n))
+        hottest = max(temps, key=lambda g: temps[g])
+        return [i for i in range(n) if i == hottest or temps.get(i, -1) >= trigger_c]
+
     def _cut_base(self, i: int) -> float:
         """The level a cut on card i starts from: its current level, except for an IDLE
         card held down only by its share of the total. That card's cap is cut instead, so
@@ -1034,7 +1044,10 @@ class PowerGovernor:
         shares = list(self.min_w)
         amount = self.total_w - sum(self.min_w[i] for i in range(n) if i not in sharers)
         lows = [self.min_w[i] for i in sharers]
-        highs = [max(self.min_w[i], self._ceil_w(i)) for i in sharers]
+        # a card held below its fair share by its own cap (a thermal or UPS cut) can't use
+        # the rest, so the water-fill hands it to the other busy cards
+        highs = [max(self.min_w[i], min(self._ceil_w(i), self.cap_w[i]) if self.cap_w
+                     else self._ceil_w(i)) for i in sharers]
 
         def filled(level: float) -> float:
             return sum(min(h, max(lo, level)) for lo, h in zip(lows, highs))
@@ -1164,7 +1177,8 @@ class PowerGovernor:
                      f"{POWER_RESTORE_DWELL_S:.0f}s")
 
     def observe_thermal(self, hottest_c: int, target_c: Optional[int],
-                        fan_pct: Optional[int] = None, fan_threshold: Optional[int] = None):
+                        fan_pct: Optional[int] = None, fan_threshold: Optional[int] = None,
+                        temps: Optional[Dict[int, int]] = None):
         """Hold the temperature target by cutting power.
 
         Cuts once the card is >= target + THERMAL_POWER_MARGIN_C for the dwell. With
@@ -1224,13 +1238,15 @@ class PowerGovernor:
             elif hot_for < THERMAL_POWER_INITIAL_DWELL_S and not no_grace:
                 return
             before = tuple(self.applied_w)
-            # every card is cut from its own level (shared airflow), and never raised
+            # only the hot cards are cut, each from its own level, never raised; with a total,
+            # the share a cut card can't use goes to the cooler busy cards (plan 003)
             self._refresh_busy(now)
+            hot = self._hot_cards(temps, trigger_c)
             levels = [self._cut_base(i) for i in range(len(self.handles))]
             step_w = max(THERMAL_POWER_MIN_STEP_W,
                          min(THERMAL_POWER_MIN_STEP_W * (2 ** excess_c),
-                             THERMAL_POWER_MAX_STEP_FRACTION * max(levels)))
-            for i in range(len(self.handles)):
+                             THERMAL_POWER_MAX_STEP_FRACTION * max(levels[i] for i in hot)))
+            for i in hot:
                 cut = min(step_w, THERMAL_POWER_MAX_STEP_FRACTION * levels[i])
                 self.cap_w[i] = max(self.min_w[i], levels[i] - max(THERMAL_POWER_MIN_STEP_W, cut))
                 self._lower_to(i, self._limit_for(i))
@@ -1250,10 +1266,12 @@ class PowerGovernor:
                    if predictive and predicted_c > hottest_c
                    else "still climbing, no grace" if climbing and hot_for < 1.0
                    else f"for {hot_for:.0f}s")
+            which = ("" if len(hot) == len(self.handles)
+                     else " on GPU " + ",".join(str(i) for i in hot))
             log.warning(f"⚠ THERMAL: {hottest_c}C{fans}, {why} (target {target_c}C, "
-                        f"+{excess_c}C over) -> -{step_w:.0f} W, power cap "
+                        f"+{excess_c}C over) -> -{step_w:.0f} W{which}, power cap "
                         + "/".join(f"{w:.0f}" for w in self.applied_w) + " W")
-            if (all(c <= lo + 0.5 for c, lo in zip(self.cap_w, self.min_w))
+            if (all(self.cap_w[i] <= self.min_w[i] + 0.5 for i in hot)
                     and hottest_c >= trigger_c):
                 log.warning("⚠ THERMAL: already at the hardware power floor and still over the "
                             "target — only the fan profile or the card's own limits can help now")
@@ -1854,7 +1872,7 @@ class FanController:
         self.governor.observe_emergency(hottest, self.emergency_c)
         fan_pct, fan_threshold = self._update_fans(temps, hottest)
         self.last_fan_pct = fan_pct
-        self.governor.observe_thermal(hottest, self.target, fan_pct, fan_threshold)
+        self.governor.observe_thermal(hottest, self.target, fan_pct, fan_threshold, temps)
 
     def _update_fans(self, temps: Dict[int, int], hottest: int) -> Tuple[Optional[int], Optional[int]]:
         """Drive the fans. Returns (the fan % we command, if any; adaptive's fan max)."""

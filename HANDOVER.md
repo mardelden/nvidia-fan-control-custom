@@ -95,7 +95,7 @@ or target is acknowledged as *masked by a command-line flag*.
 | UPS status matches `--power-floor-on` | Every GPU to its hardware floor, immediately |
 | UPS unreadable 3× | Clamp to `--power-fallback` (never raising a card that's in a hold) |
 | Total ceiling set | Idle cards at their minimum, the busy ones share the rest, lowered before raised; the sum of limits never exceeds it |
-| Total UPS load > budget | Trim the shared cap by the measured excess; restore slowly (+20 W). Only a thermal-hold recovery raises faster, bounded by headroom, and it waits for a fresh UPS sample |
+| Total UPS load > budget | Trim every card by the measured excess; restore slowly (+20 W). Only a thermal-hold recovery raises faster, bounded by headroom, and it waits for a fresh UPS sample |
 | Service stops cleanly | Fans → factory curve. Power is **never raised**: the ceiling, holds, the on-battery floor, budget trims and an out-of-band `nvidia-smi -pl` lower all stay until the next start |
 | Service crashes | Fans stay where they were unless `ExecStopPost=--reset-fans` runs (see above) |
 | Restart / reboot | Settings come back from the files. The learned adaptive trim is restored; thermal and emergency holds are restored if < 5 min old |
@@ -132,7 +132,8 @@ python3 /opt/nvidia-fan-control/nvidia-fan-control.py --clear-override
   stays there after a stop until the next start.
 - **`--power-dry-run` is power-only** (fans and the emergency still run); `--dry-run` touches
   nothing at all.
-- **The thermal cut is a shared cap**, so every card drops when the hottest card is over.
+- **The thermal cut hits only the hot card(s)**; the 92 °C emergency is still host-wide. With a
+  total, the cooler busy cards take the share a cut card can't use.
 - **`adaptive` needs a target.** Setting it without one is refused. Clearing the target while
   it's active falls back to `native`.
 - **The maximum target is emergency − 3 (89 °C).** Our old docs said 90–91; the cut point is

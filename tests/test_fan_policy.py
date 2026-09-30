@@ -198,8 +198,8 @@ tick(ctl, 6)
 check("no cut below the target", limits() == [600.0, 600.0], limits())
 set_temp(80, 70)
 tick(ctl, 1)
-check("a card CLIMBING into the target (79 -> 80) is cut at once, no grace (-30 W)",
-      limits() == [570.0, 570.0], limits())
+check("a card CLIMBING into the target (79 -> 80) is cut at once, no grace (-30 W); only that "
+      "card: GPU1 at 70C keeps 600", limits() == [570.0, 600.0], limits())
 check("thermal hold engaged", gov.thermal_limited)
 cut = limits()[0]
 set_temp(78, 70)       # = target-2
@@ -362,7 +362,8 @@ set_temp(86, 60)
 tick(ctl, 10)
 check("fans never exceed the fan max", max(f for _, f in nv.FAN_CALLS) <= 50, nv.FAN_CALLS[-4:])
 check("fans reach the fan max under heat", fans() == [50, 50], fans())
-check("power cut once fans >= max and card >= target+2 for 5 s", max(limits()) < 600.0, limits())
+check("power cut on the hot card once fans >= max; the 60C card is not cut",
+      limits()[0] < 600.0 and limits()[1] == 600.0, limits())
 
 ctl, gov, store, state, run = rig(saved={"profile": "adaptive", "target": "80"})
 set_temp(82, 60)
@@ -371,7 +372,7 @@ tick(ctl, 3)       # fans still climbing (slew +10/tick), not yet at 100
 check("adaptive (fan max 100): no cut while fans are below 100",
       limits() == [600.0, 600.0] or max(fans()) >= 100, (limits(), fans()))
 tick(ctl, 12)
-check("adaptive (fan max 100): cut once fans reach 100", max(limits()) < 600.0 and max(fans()) == 100,
+check("adaptive (fan max 100): cut once fans reach 100", limits()[0] < 600.0 and max(fans()) == 100,
       (limits(), fans()))
 set_temp(93, 60)
 ctl2, *_ = (ctl,)
@@ -865,12 +866,26 @@ for _ in range(4):
     ctl.update(); gov.update(); CLOCK.advance(2.0)
 check("a (predictive, 50%) thermal cut on the busy card: 150 / 225", limits() == [150.0, 225.0],
       limits())
-check("...the idle card's own cap is cut from its cap (600 -> 300), not recorded as 150",
-      gov.cap_w[0] == 300.0, gov.cap_w)
+check("...the cold idle card isn't cut at all (only the hot card is)", gov.cap_w[0] == 600.0,
+      gov.cap_w)
 busy_cards(True, True)
 ok = run(ctl, 2, total=600.0)
-check("GPU0 wakes: its 300 W share at once; GPU1 stays at its own 225 W thermal cap",
-      limits() == [300.0, 225.0] and ok, limits())
+check("GPU0 wakes: at once it gets its share plus what hot GPU1 can't use (375), GPU1 stays "
+      "at its 225 W thermal cap, the sum 600", limits() == [375.0, 225.0] and ok, limits())
+
+# the original bug, when the idle card is itself over the target (warmed by its neighbour)
+ctl, gov, *_ = rig(saved={"profile": "quiet", "ceiling": "600", "total": "600", "target": "80"})
+busy_cards(False, True)
+set_temp(70, 70)
+run(ctl, 8, total=600.0)
+set_temp(81, 81)
+for _ in range(4):
+    ctl.update(); gov.update(); CLOCK.advance(2.0)
+check("a hot IDLE card's cap is cut from its cap (600 -> 300), not recorded as its 150 W share",
+      gov.cap_w[0] == 300.0 and limits()[0] == 150.0, (gov.cap_w, limits()))
+busy_cards(True, True)
+ok = run(ctl, 2, total=600.0)
+check("...so when it wakes it gets 300 W at once, not 150", limits()[0] == 300.0 and ok, limits())
 
 ctl, gov, *_ = rig(saved={"ceiling": "600", "total": "600"}, budget=900)
 gov.ups.read = lambda: (400.0, ("OL",))
@@ -909,6 +924,23 @@ ctl.update()
 check("the cut lowers the card that just got busy (300 -> 150), in that same tick",
       limits() == [300.0, 150.0], limits())
 
+print("\n== only the hot card is cut; the cold busy card takes the share it frees ==")
+ctl, gov, *_ = rig(saved={"profile": "quiet", "ceiling": "600", "total": "750", "target": "80"})
+busy_cards(True, True)
+set_temp(60, 78)
+ok = run(ctl, 4)
+check("both busy: 375 / 375", limits() == [375.0, 375.0] and ok, limits())
+set_temp(60, 81)
+trace = []
+ok = run(ctl, 6, trace=trace)
+check("GPU1 over the target: only GPU1 is cut", limits()[1] < 375.0, limits())
+check("...and cold GPU0 takes what GPU1 can't use, the sum within 750 on every tick",
+      limits()[0] > 375.0 and abs(sum(limits()) - 750.0) < 1.0 and ok, trace)
+set_temp(60, 70)
+ok = run(ctl, 60, trace=trace)
+check("GPU1 cools and recovers: back to 375 / 375, the sum within 750 throughout",
+      limits() == [375.0, 375.0] and ok, limits())
+
 print("\n== a restart with a total starts each card at its full share ==")
 ctl, gov, *_ = rig(saved={"ceiling": "600", "total": "600"}, budget=900, now=300.0)
 gov.ups.read = lambda: (400.0, ("OL",))
@@ -925,8 +957,8 @@ ctl, gov, *_ = rig(saved={"profile": "quiet", "ceiling": "600,300", "target": "8
 set_temp(81, 50)
 for _ in range(4):                               # steady +1C: past the 5 s grace, one cut
     ctl.update(); CLOCK.advance(2.0)
-check("a thermal cut takes each card down from its own level (-60 W: 540/240), not both to 240",
-      limits() == [540.0, 240.0], limits())
+check("a thermal cut takes the hot card down from its own level (-60 W: 540), the 50C card "
+      "keeps its 300", limits() == [540.0, 300.0], limits())
 before = limits()
 set_temp(60, 50)
 trace = []

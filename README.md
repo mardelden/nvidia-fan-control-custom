@@ -127,6 +127,8 @@ cards are busy, reading each card's draw and utilization from NVML every 2 s (no
   total, even for a moment.
 - **A card that wakes up gets its share at once**, limited only by a real UPS or temperature
   cut, not by the 150 W it idled at.
+- **A card held below its share by its own cut** (too hot, or a UPS trim) leaves the rest to
+  the other busy cards, still within the total.
 
 With `750` on pve-ai, one busy card runs at 600 W while the other idles at 150 W, and two busy
 cards get ~375 W each. Unlike the UPS budget, the total holds however fast the load arrives,
@@ -136,7 +138,7 @@ and trims sustained load. A total below the GPUs' combined minimum (300 W) is re
 ### The UPS budget
 
 With `--power-budget`, the governor keeps **total** UPS load (CPU, board and disks included)
-under the budget. It trims one shared cap by the measured excess on the first over-budget
+under the budget. It trims every card by the measured excess on the first over-budget
 reading, then restores slowly: three consecutive readings with headroom, +20 W, and at least
 30 s between raises. Only a recovery from a thermal hold takes the faster exponential step,
 bounded by the measured headroom, and then waits for a fresh UPS sample before the next one. An `OB` status clamps every GPU to its floor. If the UPS can't be read
@@ -235,9 +237,13 @@ For real load, use the deploy team's `gpu-burn` in the `gpu-test` container (VMI
   takes each card down from its own level.
 - **The 2 s poll is the remaining limit on overshoot.** A hot card at 600 W with 30% fan climbs
   ~6 °C per reading, so one reading is the earliest reaction.
-- **The thermal cut hits every card.** When the hottest card is over, every card is cut from
-  its own level. That's right for back-to-back cards. An idle card held at its 150 W share has
-  its cap trimmed instead, so it still gets its full share when it wakes up.
+- **The thermal cut hits only the hot card.** The law runs on the hottest card, but a cut
+  applies to the cards at or over the target (and the hottest one, for a predictive cut).
+  With a total, what a cut card can't use goes to the cooler busy cards. On pve-ai GPU0's
+  exhaust heats GPU1, so GPU1 tends to end up with the smaller share. That's stable and
+  measured (plan 003). An idle card held at its 150 W share that's itself over the target has
+  its cap trimmed instead, so it still gets its full share when it wakes up. The 92 °C
+  emergency is still host-wide.
 - **Stopping never raises**, and that includes the total: an idle card stays at its 150 W
   share after a stop, until the next start.
 - **Changed defaults compared with older versions:** no file now means `native` with mirror
