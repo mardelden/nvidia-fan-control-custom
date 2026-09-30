@@ -94,7 +94,7 @@ or target is acknowledged as *masked by a command-line flag*.
 | A card's temperature unreadable in 3 of the last 5 readings | Blind: every GPU to its minimum power, owned fans 100% (`native` left alone); released after 30 s of good readings, +20 W steps. A single missed reading counts at the last known temperature |
 | UPS status matches `--power-floor-on` | Every GPU to its hardware floor, immediately |
 | UPS unreadable 3× | Clamp to `--power-fallback` (never raising a card that's in a hold) |
-| Total ceiling set | The busy cards share it (each up to its ceiling and its own cut); idle cards get their minimum plus what the busy ones can't use; lowered before raised, so the sum of limits never exceeds it. An idle, cool card's old cuts are cleared after 60 s |
+| Total ceiling set (soft) | Idle cards counted at 75 W (their limit stays at the 150 W floor); the busy cards share the rest, each up to its ceiling and its own cut; idle cards also hold what the busy ones can't use; lowered before raised. The draw stays within the total, except for a tick or two when an idle card wakes (at most +75 W per waking card). An idle, cool card's old cuts are cleared after 60 s |
 | Total UPS load > budget | Trim every card by the measured excess; restore slowly (+20 W). Only a thermal-hold recovery raises faster, bounded by headroom, and it waits for a fresh UPS sample |
 | Service stops cleanly | Fans → factory curve. Power is **never raised**: the ceiling, holds, the on-battery floor, budget trims and an out-of-band `nvidia-smi -pl` lower all stay until the next start |
 | Service crashes | Fans stay where they were unless `ExecStopPost=--reset-fans` runs (see above) |

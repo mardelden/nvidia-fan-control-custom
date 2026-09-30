@@ -229,6 +229,13 @@ POWER_IDLE_DWELL_S = 60.0
 # or POWER_IDLE_UTIL_PCT), and as idle only after ALLOC_IDLE_DWELL_S below both, so a pause
 # between requests doesn't move power around.
 ALLOC_IDLE_DWELL_S = 10.0
+# A SOFT total (operator, 2026-09-29): an idle card is counted at ALLOC_IDLE_RESERVE_W, the
+# most an idle card draws (above it, it counts as busy), not at its 150 W minimum limit. So
+# a lone busy card gets total - 75 W (600 W at a 700 W total) instead of total - 150. The
+# sum of the LIMITS may exceed the total by (minimum - reserve) per idle card; the sum of the
+# DRAW stays within it, except for a tick or two when an idle card wakes, until the busy
+# card is lowered.
+ALLOC_IDLE_RESERVE_W = POWER_IDLE_DRAW_W
 
 # Fail-safe: if the UPS can't be read this many times in a row we are flying blind, so
 # clamp to a conservative per-GPU limit rather than assume headroom.
@@ -1011,10 +1018,11 @@ class PowerGovernor:
             except pynvml.NVMLError as e:
                 log.error(f"GPU {i}: power limit read failed: {e}")
                 continue
-            if actual > self.max_w[i] + 0.5:
+            if actual > max(self.min_w[i], self.max_w[i]) + 0.5:
                 bound = "share of the total" if self.max_w[i] < self._ceil_w(i) - 0.5 else "ceiling"
                 log.warning(f"⚠ POWER: GPU {i} limit is {actual:.0f} W, above its "
-                            f"{self.max_w[i]:.0f} W {bound} — changed out of band; re-applying")
+                            f"{max(self.min_w[i], self.max_w[i]):.0f} W {bound} — changed out "
+                            "of band; re-applying")
                 self.applied_w[i] = actual
                 self._set_limit(i, self.max_w[i])
 
@@ -1098,7 +1106,8 @@ class PowerGovernor:
         note = (f"; above the {top:.0f} W sum of the GPUs' ceilings, so it doesn't bind"
                 if total >= top - 0.5 else "")
         log.info(f"POWER: total ceiling set to {total:g} W across {n} GPU(s) ({source}); "
-                 f"idle GPUs at their minimum, the busy ones share the rest{note}")
+                 f"soft: idle GPUs counted at {ALLOC_IDLE_RESERVE_W:.0f} W, the busy ones "
+                 f"share the rest{note}")
         self._allocate(time.monotonic(), refresh=True)
         if self.budget_w is None:
             self._hold_ceiling()
@@ -1148,28 +1157,48 @@ class PowerGovernor:
             level = lo_level
         return [float(int(min(h, max(lo, level)))) for lo, h in zip(lows, highs)]
 
+    def _idle_reserve_w(self, i: int) -> float:
+        """What an idle card is counted at in the (soft) total: what it can draw while
+        idle, not its minimum limit."""
+        return min(ALLOC_IDLE_RESERVE_W, self.min_w[i])
+
     def _shares(self, busy: List[bool]) -> List[float]:
-        """Split the total. The busy cards share it first, each up to what it can take;
-        what they can't use goes to the idle cards ahead of time, so a card that wakes up
-        already has it (the busy cards take it back, lower before raise, when they can use
-        it again). All busy or all idle: everyone shares."""
+        """Split the total (soft). The busy cards share it first, each up to what it can
+        take, with every idle card counted at its idle reserve (75 W) rather than its 150 W
+        minimum. What the busy cards can't use goes to the idle cards ahead of time, so a
+        card that wakes up already has it (the busy cards take it back, lower before raise,
+        when they can use it again). All busy or all idle: everyone shares.
+
+        An idle card's share can be below its minimum limit; its limit then stays at the
+        minimum (the hardware floor), which is the "soft" part."""
         n = len(self.handles)
         sharers = [i for i in range(n) if busy[i]]
         if not sharers or len(sharers) == n:
             sharers = list(range(n))
         idle = [i for i in range(n) if i not in sharers]
         shares = list(self.min_w)
-        amount = self.total_w - sum(self.min_w[i] for i in idle)
+        reserve = {i: self._idle_reserve_w(i) for i in idle}
+        amount = self.total_w - sum(reserve.values())
         for i, w in zip(sharers, self._water_fill(amount, [self.min_w[i] for i in sharers],
                                                   [self._share_high(i) for i in sharers])):
             shares[i] = w
+        for i in idle:
+            shares[i] = reserve[i]
         leftover = self.total_w - sum(shares)
         if idle and leftover >= 1.0:
-            amount = sum(self.min_w[i] for i in idle) + leftover
-            for i, w in zip(idle, self._water_fill(amount, [self.min_w[i] for i in idle],
+            amount = sum(reserve.values()) + leftover
+            for i, w in zip(idle, self._water_fill(amount, [reserve[i] for i in idle],
                                                    [self._share_high(i) for i in idle])):
                 shares[i] = w
         return shares
+
+    def limit_sum_bound_w(self) -> Optional[float]:
+        """The most the power LIMITS may add up to under the soft total: the total, plus
+        (minimum - reserve) for each idle card, whose limit can't go below its minimum."""
+        if self.total_w is None:
+            return None
+        return self.total_w + sum(max(0.0, self.min_w[i] - self._idle_reserve_w(i))
+                                  for i in range(len(self.handles)) if not self._busy[i])
 
     def _note_activity(self, busy_now: List[bool], now: float):
         """Busy at once; idle only after ALLOC_IDLE_DWELL_S. An unreadable card is busy."""
@@ -1217,7 +1246,7 @@ class PowerGovernor:
         else:
             new = want
         stuck = [i for i in range(n) if self.alloc_w is not None
-                 and self.applied_w[i] > self.max_w[i] + 0.5]
+                 and self.applied_w[i] > max(self.min_w[i], self.max_w[i]) + 0.5]
         if self.alloc_w is not None and not lowering and not raising and not stuck:
             return
         self.alloc_w = new
@@ -1227,7 +1256,8 @@ class PowerGovernor:
         # a lowering that didn't take (an NVML write error) leaves a card above its share:
         # no card is raised until every card is within its share, or the sum could exceed
         # the total (deploy-team review of plan 003)
-        stuck = [i for i in range(n) if self.applied_w[i] > self.max_w[i] + 0.5]
+        stuck = [i for i in range(n)
+                 if self.applied_w[i] > max(self.min_w[i], self.max_w[i]) + 0.5]
         if stuck:
             log.warning("⚠ POWER: GPU " + ",".join(str(i) for i in stuck) + " still above its "
                         "share of the total (a limit write failed); raises held until it's down")

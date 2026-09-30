@@ -762,15 +762,18 @@ def busy_cards(*flags):
         d.draw, d.util = (300.0, 90) if b else (20.0, 0)
 
 
-def sum_ok(total=750.0):
-    return sum(limits()) <= total + 0.5
+def sum_ok(total=750.0, gov=None):
+    """The sum of the limits within the (soft) total: an idle card sits at its 150 W minimum
+    but is counted at 75 W, so the bound is the total + 75 W per idle card."""
+    bound = gov.limit_sum_bound_w() if gov is not None and gov.total_w is not None else total
+    return sum(limits()) <= bound + 0.5
 
 
 def run(ctl, n, dt=2.0, total=750.0, trace=None):
     ok = True
     for _ in range(n):
         ctl.update(); ctl.governor.update(); CLOCK.advance(dt)
-        ok = ok and sum_ok(total)
+        ok = ok and sum_ok(total, ctl.governor)
         if trace is not None:
             trace.append(tuple(limits()))
     return ok
@@ -860,18 +863,21 @@ ctl, gov, *_ = rig(saved={"profile": "quiet", "ceiling": "600", "total": "600", 
 busy_cards(False, True)
 set_temp(50, 70)
 run(ctl, 8, total=600.0)
-check("GPU1 busy, GPU0 idle: 150 / 450", limits() == [150.0, 450.0], limits())
+check("GPU1 busy, GPU0 idle: 150 / 525 (soft total: the idle card counted at 75 W)",
+      limits() == [150.0, 525.0], limits())
 set_temp(50, 81)
 for _ in range(4):
     ctl.update(); gov.update(); CLOCK.advance(2.0)
-check("a (predictive, 50%) thermal cut on the busy card (225); the idle card holds what it "
-      "frees ahead of time (375)", limits() == [375.0, 225.0], limits())
+check("a (predictive, 50%) thermal cut on the busy card (525 -> 262.5); the idle card holds "
+      "what it frees ahead of time (337)", limits()[1] == 262.5 and 337.0 <= limits()[0] <= 338.0,
+      limits())
 check("...the cold idle card isn't cut at all (only the hot card is)", gov.cap_w[0] == 600.0,
       gov.cap_w)
 busy_cards(True, True)
 ok = run(ctl, 2, total=600.0)
-check("GPU0 wakes: at once it gets its share plus what hot GPU1 can't use (375), GPU1 stays "
-      "at its 225 W thermal cap, the sum 600", limits() == [375.0, 225.0] and ok, limits())
+check("GPU0 wakes: at once it gets its share plus what hot GPU1 can't use (337), GPU1 stays "
+      "at its 262.5 W thermal cap, the sum within 600", 337.0 <= limits()[0] <= 338.0
+      and limits()[1] == 262.5 and sum(limits()) <= 600.5 and ok, limits())
 
 # the original bug, when the idle card is itself over the target (warmed by its neighbour)
 ctl, gov, *_ = rig(saved={"profile": "quiet", "ceiling": "600", "total": "600", "target": "80"})
@@ -894,8 +900,8 @@ run(ctl, 8, total=600.0)
 gov.ups.read = lambda: (1000.0, ("OL",))
 gov._feedback_wait_total_w = None
 gov.update(force=True)
-check("UPS over by 100 W: busy GPU1 450 -> 350, idle GPU0 stays at 150",
-      limits() == [150.0, 350.0], limits())
+check("UPS over by 100 W: busy GPU1 525 -> 425, idle GPU0 stays at 150",
+      limits() == [150.0, 425.0], limits())
 check("...and GPU0's own cap is trimmed from its cap (600 -> 500), not set to 150",
       gov.cap_w[0] == 500.0, gov.cap_w)
 busy_cards(True, True)
@@ -1098,11 +1104,25 @@ ctl, gov, *_ = rig(saved={"ceiling": "600", "total": "600"}, budget=900, now=300
 gov.ups.read = lambda: (400.0, ("OL",))
 busy_cards(False, True)
 ok = run(ctl, 7, total=600.0)
-check("cards left at 300 W by the last run: GPU1 gets its 450 W share, no crawl",
-      limits() == [150.0, 450.0] and ok, limits())
+check("cards left at 300 W by the last run: GPU1 gets its 525 W share (soft), no crawl",
+      limits() == [150.0, 525.0] and ok, limits())
 ctl, gov, *_ = rig(saved={"ceiling": "600"}, budget=900, now=300.0)
 check("without a total, a restart still starts from the current limits (unchanged)",
       gov.cap_w == [300.0, 300.0], gov.cap_w)
+
+print("\n== the soft total (operator): a lone busy card gets total - 75, not total - 150 ==")
+ctl, gov, *_ = rig(saved={"ceiling": "600", "total": "700"})
+busy_cards(False, True)
+run(ctl, 8, total=700.0)
+check("total 700: busy GPU1 gets 600 (700 - 75, capped at 600), idle GPU0 sits at its 150 floor",
+      limits() == [150.0, 600.0], limits())
+check("...the limits add up to 750, within the soft bound (700 + 75 for the idle card)",
+      sum(limits()) <= gov.limit_sum_bound_w() + 0.5, (limits(), gov.limit_sum_bound_w()))
+busy_cards(True, True)
+trace = []
+run(ctl, 3, total=700.0, trace=trace)
+check("GPU0 wakes: GPU1 lowered first, then an equal split within the hard total (350 / 350)",
+      limits() == [350.0, 350.0] and trace[0][1] == 350.0, trace)
 
 print("\n== deploy-team review of plan 003 ==")
 # effective.json follows the governor, not just settings changes
@@ -1114,8 +1134,9 @@ busy_cards(False, True)
 run(ctl, 8, total=700.0)
 ctl.refresh_effective()
 doc = json.load(open(os.path.join(ctl.run_dir, "effective.json")))
-check("effective.json shows the limits and shares in force after the split moved (150/550)",
-      doc["power_limits_w"] == [150, 550] and doc["total_shares_w"] == [150, 550],
+check("effective.json shows the limits and shares in force after the split moved: limits "
+      "150/600, shares 100/600 (the idle card's share is below its 150 W floor)",
+      doc["power_limits_w"] == [150, 600] and doc["total_shares_w"] == [100, 600],
       (doc["power_limits_w"], doc["total_shares_w"]))
 
 # (1) a lowering that fails must hold every raise
@@ -1127,11 +1148,11 @@ busy_cards(False, True)
 nv.DEVS[0].set_fail = 3                      # GPU0's next three limit writes fail
 trace = []
 ok = run(ctl, 10, total=700.0, trace=trace)
-check("GPU0's lowering fails 3 times: GPU1 is not raised meanwhile, the sum never over 700",
-      ok, trace)
+check("GPU0's lowering fails 3 times: GPU1 is not raised meanwhile (the sum within the soft "
+      "bound)", ok and all(t[1] == 350.0 for t in trace if t[0] > 150.0), trace)
 run(ctl, 3, total=700.0)
-check("...GPU0 lowered on a retry, then GPU1 raised: 150 / 550", limits() == [150.0, 550.0],
-      limits())
+check("...GPU0 lowered on a retry, then GPU1 raised: 150 / 600 (soft: 700 - 75, capped at the "
+      "600 ceiling)", limits() == [150.0, 600.0], limits())
 
 # (3) after a restart with a UPS budget, full shares only once the first UPS reading is fine
 ctl, gov, *_ = rig(saved={"ceiling": "600", "total": "700"}, budget=900, now=300.0)

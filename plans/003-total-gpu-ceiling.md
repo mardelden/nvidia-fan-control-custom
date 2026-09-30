@@ -199,3 +199,24 @@ below the target. The per-card idle reset gave GPU0 510–540 W of spare budget.
 cut fired on a waking card. At 60 °C both cards together sustain only ~390–480 W with the
 fans near max, so the temperature bound there, not the total. GPU1 (in GPU0's exhaust) took
 the smaller share. Tests: 216 + 23.
+
+## Addendum 3: a soft total (operator, 2026-09-29)
+
+**Seen:** at a 700 W total a lone busy card got only 550 W. The idle card's 150 W minimum
+limit counted against the total although it draws ~20 W. **Operator's decision:** make the
+total soft. "The system can tolerate a few seconds" over it.
+
+- An idle card is counted at `ALLOC_IDLE_RESERVE_W` = 75 W (`POWER_IDLE_DRAW_W`: above it a
+  card counts as busy, so an idle card never draws more), not at its minimum. A lone busy
+  card gets total − 75: 600 W at 700 (capped by its 600 W ceiling).
+- The sum of the limits may exceed the total by (minimum − 75) per idle card
+  (`limit_sum_bound_w`). The draw stays within it, except when an idle card wakes. It can
+  then draw up to its 150 W limit for a tick or two (2–4 s) before the busy card is lowered:
+  at most 75 W over per waking card (50 W at 700 / 600).
+- Guards that compared a card's limit with its share now compare with
+  `max(minimum, share)`: the failed-lowering check and `enforce_ceiling`.
+- **Rejected alternative:** a hard total of 750. It gives the same 600 W, but a 750 W worst
+  case with both cards busy, against 700 here.
+
+Prepared and unit-tested only (226 + 23), **not deployed or hardware-tested** (operator,
+2026-09-29).

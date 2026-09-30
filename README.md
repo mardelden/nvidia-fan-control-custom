@@ -127,13 +127,19 @@ A per-GPU ceiling is a hard bound, but it caps a lone busy card as tightly as tw
 ones. The **total ceiling** bounds the sum instead, and the governor moves it to whichever
 cards are busy, reading each card's draw and utilization from NVML every 2 s (no lag):
 
-- The **busy** cards share the total equally, each up to what it can take (its per-GPU
-  ceiling, and below that its own temperature or UPS cut). **Idle cards** (≤ 75 W and ≤ 5% for
-  10 s) get their minimum, 150 W, **plus whatever the busy cards can't use, ahead of time**, so
-  it's there when they wake. If all the cards are busy, or all are idle, they split it equally.
+- **It's a soft total.** An **idle card** (≤ 75 W and ≤ 5% for 10 s) is counted at **75 W**,
+  the most an idle card draws, not at its 150 W minimum limit. The **busy** cards share the
+  rest equally, each up to what it can take (its per-GPU ceiling, and below that its own
+  temperature or UPS cut). What the busy cards can't use goes to the idle cards ahead of time,
+  so it's there when they wake. If all the cards are busy, or all are idle, they split it
+  equally.
+- **What "soft" means:** the draw stays within the total. The *limits* can add up to
+  75 W more per idle card, because an idle card's limit can't go below its 150 W floor. When
+  an idle card wakes, the draw can exceed the total by up to that much for a tick or two
+  (2–4 s), until the busy card is lowered. The operator chose this so a lone busy card can
+  use total − 75 instead of total − 150.
 - **Lower before raise.** When the split changes, the cards losing power are lowered first,
-  and the others are raised a tick (2 s) later. So the limits never add up to more than the
-  total, even for a moment.
+  and the others are raised a tick (2 s) later.
 - **A card that wakes up gets its share at once**, limited only by a real UPS or temperature
   cut, not by the 150 W it idled at.
 - **A card held below its share by its own cut** (too hot, or a UPS trim) leaves the rest to
@@ -143,9 +149,10 @@ cards are busy, reading each card's draw and utilization from NVML every 2 s (no
   workload that has gone. This happens only with a total, which is what bounds the card when
   it wakes.
 
-With `750` on pve-ai, one busy card runs at 600 W while the other idles at 150 W, and two busy
-cards get ~375 W each. Unlike the UPS budget, the total holds however fast the load arrives,
-because it bounds what the cards *can* draw. The UPS budget stays: it covers the CPU and disks
+With `700` on pve-ai, one busy card runs at 600 W (700 − 75, capped by its 600 W ceiling)
+while the other idles at its 150 W floor, and two busy cards get 350 W each. Unlike the UPS
+budget, the total holds however fast the load arrives, within the soft margin above, because
+it bounds what the cards *can* draw. The UPS budget stays: it covers the CPU and disks
 and trims sustained load. A total below the GPUs' combined minimum (300 W) is refused.
 
 ### The UPS budget
