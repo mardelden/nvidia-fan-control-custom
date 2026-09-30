@@ -1,6 +1,6 @@
 # Plan: A total GPU power ceiling, split between the cards (per-card caps)
 
-**Status:** Implemented (fork; hardware-tested on pve-ai 2026-09-29, not yet deployed)
+**Status:** Implemented (fork; hardware-tested on pve-ai 2026-09-29, not yet deployed; see addenda)
 **Date:** 2026-09-29
 
 ## Context
@@ -178,3 +178,24 @@ Hardware (pve-ai, 17:16): both cards burning, total 600, target 62, fans at max.
 (330 → 360 W), with the sum at exactly 600 W. When GPU0 reached 62 °C in turn, only GPU0 was
 cut. The coupling is visible: with GPU0 at 300–360 W, GPU1 held 61–62 °C even at 180 W. It
 was at 63–64 °C at 300 W alone. Tests: 195 + 23.
+
+## Addendum 2: sharing, fans and recovery (operator, 2026-09-29, from the hardware runs)
+
+The operator watched four-phase runs (GPU0, then both, then GPU1 alone, then both; total 750,
+ceiling 600, `adaptive`, target 60) and asked for five changes, each seen on the hardware:
+
+| Seen | Change |
+|---|---|
+| An idle card at 150 W while the busy card was held at 300 W for heat: 300 W of the total unused | **Idle cards hold what the busy cards can't use, ahead of time** (`_shares`: busy cards first, then the leftover to the idle ones); the busy card takes it back, lower before raise |
+| During a hold, adaptive learned a −26% trim, the fans sat at ~75%, the card at 58–60 °C: never target − 2 for 30 s, so power never came back | **While power is held for heat (the hold and the walk back), adaptive's fans follow the base curve and learn no quieter trim** (`heat_state`). An interim version pinned the fans at max; the operator rejected it (fans stuck at 100% long after the need) |
+| Power restored only at target − 2 for 30 s, even with the fans below their max | **Adaptive: released once the card is below the target for 10 s; the walk pauses at the target** (`_thermal_room`). With the fans on the curve, "below the target" is "the fans have room". The fixed curves keep 2 °C / 30 s |
+| A cool card crawled +20 W because the other card sat at the release point | **The recovery step is sized by each card's own temperature** (`raise_step_w(level, temp)`) |
+| An idle, cool card kept the cuts it got while busy (215 W with 570 W free) | **Per-card idle reset, with a total only:** idle 60 s and below the release point → cap back to its ceiling (`_reset_idle_caps`). Without a total the UPS behaviour is unchanged |
+| (Operator's question) keep the predictive rule on the way back? | The predictive cut is unchanged; **a recovery step also waits while the card is still climbing** (the cut's own definition) (`_card_climbing`) |
+
+The final hardware run (all but the last row) showed: the fans at 93–97% near 60 °C, never
+pinned, and 95 → 60% within 40 s of the load stopping. Holds released 10 s after the card went
+below the target. The per-card idle reset gave GPU0 510–540 W of spare budget. The predictive
+cut fired on a waking card. At 60 °C both cards together sustain only ~390–480 W with the
+fans near max, so the temperature bound there, not the total. GPU1 (in GPU0's exhaust) took
+the smaller share. Tests: 216 + 23.

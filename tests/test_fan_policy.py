@@ -809,8 +809,8 @@ check("GPU1 idle for 10 s: 600 / 150", limits() == [600.0, 150.0] and ok, limits
 ctl, gov, *_ = rig(saved={"ceiling": "300", "total": "750"})
 busy_cards(True, False)
 run(ctl, 8)
-check("a per-GPU ceiling still bounds the busy card (300, not 600)", limits() == [300.0, 150.0],
-      limits())
+check("a per-GPU ceiling still bounds the busy card (300, not 600); the idle card holds the "
+      "rest ahead of time, up to its own 300 ceiling", limits() == [300.0, 300.0], limits())
 ctl, gov, *_ = rig(saved={"ceiling": "500,300", "total": "750"})
 busy_cards(True, True)
 run(ctl, 3)
@@ -864,8 +864,8 @@ check("GPU1 busy, GPU0 idle: 150 / 450", limits() == [150.0, 450.0], limits())
 set_temp(50, 81)
 for _ in range(4):
     ctl.update(); gov.update(); CLOCK.advance(2.0)
-check("a (predictive, 50%) thermal cut on the busy card: 150 / 225", limits() == [150.0, 225.0],
-      limits())
+check("a (predictive, 50%) thermal cut on the busy card (225); the idle card holds what it "
+      "frees ahead of time (375)", limits() == [375.0, 225.0], limits())
 check("...the cold idle card isn't cut at all (only the hot card is)", gov.cap_w[0] == 600.0,
       gov.cap_w)
 busy_cards(True, True)
@@ -881,8 +881,8 @@ run(ctl, 8, total=600.0)
 set_temp(81, 81)
 for _ in range(4):
     ctl.update(); gov.update(); CLOCK.advance(2.0)
-check("a hot IDLE card's cap is cut from its cap (600 -> 300), not recorded as its 150 W share",
-      gov.cap_w[0] == 300.0 and limits()[0] == 150.0, (gov.cap_w, limits()))
+check("a hot IDLE card's cap is cut from its cap (600 -> 300), not recorded as its share",
+      gov.cap_w[0] == 300.0 and limits()[0] == 300.0, (gov.cap_w, limits()))
 busy_cards(True, True)
 ok = run(ctl, 2, total=600.0)
 check("...so when it wakes it gets 300 W at once, not 150", limits()[0] == 300.0 and ok, limits())
@@ -940,6 +940,158 @@ set_temp(60, 70)
 ok = run(ctl, 60, trace=trace)
 check("GPU1 cools and recovers: back to 375 / 375, the sum within 750 throughout",
       limits() == [375.0, 375.0] and ok, limits())
+
+print("\n== budget the busy card can't use waits on the idle card; taken back when needed ==")
+ctl, gov, *_ = rig(saved={"profile": "quiet", "ceiling": "600", "total": "750", "target": "80"})
+busy_cards(True, False)
+set_temp(78, 50)
+run(ctl, 7)
+check("GPU0 busy, GPU1 idle: 600 / 150", limits() == [600.0, 150.0], limits())
+set_temp(81, 50)
+trace = []
+ok = run(ctl, 6, trace=trace)
+check("GPU0 cut for heat: idle GPU1 is handed what GPU0 can't use, ahead of any load",
+      limits()[0] < 600.0 and limits()[1] > 150.0 and abs(sum(limits()) - 750.0) < 1.0, trace)
+set_temp(60, 50)
+ok = run(ctl, 80, trace=trace) and ok
+check("GPU0 cools: GPU1 is lowered first and GPU0 takes it back, 600 / 150, the sum within 750 "
+      "on every tick", limits() == [600.0, 150.0] and ok, trace[-6:])
+
+print("\n== adaptive: power comes back below the target; the fans just follow temperature ==")
+# pve-ai 2026-09-29: during a hold adaptive learned a -26% trim (fans ~75%) because the card
+# sat just under the target, so it never reached target-2 and power never came back.
+# Operator's rule: the fans follow temperature only, and power comes back whenever the card
+# is below the target (the fans then aren't at their max), pausing at the target.
+ctl, gov, *_ = rig(saved={"profile": "adaptive", "ceiling": "600", "total": "750", "target": "60"})
+busy_cards(True, False)
+set_temp(58, 45)
+run(ctl, 3)
+set_temp(63, 45)
+run(ctl, 15)
+check("hot: fans at 100, then power cut (fans first)", max(fans()) == 100 and gov.thermal_limited
+      and limits()[0] < 600.0, (fans(), limits()))
+cut_w = limits()[0]
+set_temp(59, 45)                             # 1C under the target, not target-2
+run(ctl, 3)
+check("just under the target: the fans follow the curve (96%, not pinned), no quiet trim",
+      fans() == [96, 96] and ctl._target_trim_pct == 0.0, (fans(), ctl._target_trim_pct))
+run(ctl, 3)
+check("below the target for 10 s: the hold releases (no target-2 / 30 s wait for adaptive)",
+      not gov.thermal_limited and gov.recovery_walk, (gov.thermal_limited, gov.recovery_walk))
+run(ctl, 22)                                 # one 30 s step, then the idle card lowered first
+check("...and power walks back up while the card stays below the target",
+      limits()[0] > cut_w, (cut_w, limits()))
+set_temp(60, 45)                             # at the target: the walk pauses
+held = limits()[0]
+run(ctl, 20)
+check("at the target the walk pauses (no cut either: fans at 100 only just now)",
+      limits()[0] == held or gov.thermal_limited, (held, limits(), gov.thermal_limited))
+set_temp(50, 45)
+run(ctl, 150)
+check("cool: power fully back (600), then adaptive quiets the fans again",
+      limits()[0] == 600.0 and not gov.recovery_walk and max(fans()) < 100, (limits(), fans()))
+
+# the fixed curves keep the 2C / 30 s release
+ctl, gov, *_ = rig(saved={"profile": "quiet", "ceiling": "600", "target": "60"})
+busy_cards(True, False)
+set_temp(58, 45)
+run(ctl, 3, total=1e9)
+set_temp(63, 45)
+run(ctl, 5, total=1e9)
+set_temp(59, 45)
+run(ctl, 20, total=1e9)
+check("fixed curve: 59C (above target-2) keeps the hold", gov.thermal_limited)
+
+# once the load stops the fans come down
+ctl, gov, *_ = rig(saved={"profile": "adaptive", "ceiling": "600", "total": "750", "target": "60"})
+busy_cards(True, False)
+set_temp(58, 45)
+run(ctl, 3)
+set_temp(63, 45)
+run(ctl, 15)
+busy_cards(False, False)
+set_temp(50, 45)
+run(ctl, 12)
+check("the load stops: the fans come down with the temperature", max(fans()) < 100,
+      (fans(), gov.recovery_walk, gov._busy))
+
+print("\n== recovery waits while a card is still warming up (the cut's own 'climbing') ==")
+ctl, gov, *_ = rig(saved={"profile": "adaptive", "ceiling": "600", "total": "750", "target": "60"})
+busy_cards(True, False)
+set_temp(58, 45)
+run(ctl, 3)
+set_temp(63, 45)
+run(ctl, 15)
+set_temp(55, 45)
+run(ctl, 25)                                 # released, and at least one step taken
+check("released and walking back", not gov.thermal_limited and gov.recovery_walk)
+# wait for a step, then climb 1C per reading for longer than a 30 s step interval
+b = gov.cap_w[0]
+for _ in range(40):
+    run(ctl, 1)
+    if gov.cap_w[0] > b:
+        break
+before = gov.cap_w[0]
+climbing_steps = 0
+for t in range(40, 60):                      # 40 -> 59C over 40 s: always warmer than 2 readings ago
+    set_temp(t, 45)
+    b = gov.cap_w[0]
+    run(ctl, 1)
+    if gov.cap_w[0] > b:
+        climbing_steps += 1
+check("no step while the card keeps warming (40 s of climbing)", climbing_steps == 0,
+      climbing_steps)
+set_temp(58, 45)
+run(ctl, 20)
+check("settled (58C, below the target): the walk resumes", gov.cap_w[0] > before, (before, gov.cap_w))
+
+print("\n== recovery per card: a cool card comes back fast while the other sits near the target ==")
+ctl, gov, *_ = rig(saved={"profile": "quiet", "ceiling": "600", "target": "60"}, budget=900)
+gov.ups.read = lambda: (500.0, ("OL",))
+busy_cards(True, True)
+set_temp(59, 59)
+run(ctl, 3, total=1e9)
+set_temp(61, 61)
+run(ctl, 4, total=1e9)
+check("both cut for heat", max(limits()) < 600.0 and gov.thermal_limited, limits())
+set_temp(45, 58)                             # GPU0 cool, GPU1 at the release point
+run(ctl, 18, total=1e9)
+before = limits()
+steps = []
+for _ in range(20):
+    b = limits(); gov._feedback_wait_total_w = None
+    ctl.update(); gov.update(); CLOCK.advance(2.0)
+    if limits() != b:
+        steps.append((limits()[0] - b[0], limits()[1] - b[1]))
+check("GPU0 (45C) recovers in big steps, GPU1 (58C) in +20 W steps",
+      steps and steps[0][0] > 40.0 and steps[0][1] == 20.0, (before, steps))
+
+print("\n== per-card idle reset (with a total): old cuts cleared once a card idles and cools ==")
+ctl, gov, *_ = rig(saved={"profile": "quiet", "ceiling": "600", "total": "750", "target": "60"},
+                   budget=900)
+gov.ups.read = lambda: (1100.0, ("OL",))
+busy_cards(True, True)
+set_temp(50, 50)
+run(ctl, 6)
+check("both busy, the UPS over budget: both trimmed", max(gov.cap_w) < 375.0, gov.cap_w)
+gov.ups.read = lambda: (400.0, ("OL",))
+busy_cards(False, True)
+run(ctl, 20)
+check("GPU0 idle 40 s: still its old cut", gov.cap_w[0] < 600.0, gov.cap_w)
+run(ctl, 12)
+check("GPU0 idle 60 s and cool: its cap is back to 600", gov.cap_w[0] == 600.0, gov.cap_w)
+run(ctl, 2)
+check("...and it holds the budget busy GPU1 can't use (not stuck at its old trim)",
+      limits()[0] > 300.0 and sum(limits()) <= 750.5, limits())
+ctl, gov, *_ = rig(saved={"profile": "quiet", "ceiling": "600"}, budget=900)
+gov.ups.read = lambda: (1100.0, ("OL",))
+busy_cards(True, True)
+run(ctl, 6, total=1e9)
+gov.ups.read = lambda: (400.0, ("OL",))
+busy_cards(False, True)
+run(ctl, 35, total=1e9)
+check("without a total, an idle card keeps its UPS trim (UPS behaviour unchanged)",
+      gov.cap_w[0] < 600.0, gov.cap_w)
 
 print("\n== a restart with a total starts each card at its full share ==")
 ctl, gov, *_ = rig(saved={"ceiling": "600", "total": "600"}, budget=900, now=300.0)

@@ -166,6 +166,11 @@ THERMAL_POWER_RECOVER_MARGIN_C = 2
 # a UPS budget, a raise is also bounded by the measured headroom. After an EMERGENCY,
 # recovery stays at the conservative +20 W: that hold means something went badly wrong.
 THERMAL_POWER_RECOVER_DWELL_S = 30.0
+# adaptive (operator, plan 003): power comes back whenever the card is below the target, after
+# THERMAL_ADAPTIVE_RELEASE_DWELL_S there, and restoring pauses at the target. The fans just
+# follow temperature and rise as power returns; with them on the curve, "below the target" is
+# "the fans aren't at their max yet". The fixed curves keep the 2 C / 30 s release.
+THERMAL_ADAPTIVE_RELEASE_DWELL_S = 10.0
 
 # ── emergency cutoff: always armed, for every profile ──
 # At the emergency temperature for EMERGENCY_DWELL_S, every GPU drops to its hardware
@@ -672,6 +677,10 @@ class PowerGovernor:
         self._busy: List[bool] = []
         self._quiet_since: List[Optional[float]] = []
         self._last_busy_now: Optional[List[bool]] = None
+        self._last_busy_at: List[float] = []
+        self._last_temps: Optional[Dict[int, int]] = None
+        self._fan_threshold: Optional[int] = None      # set while adaptive drives the fans
+        self._card_recent: Dict[int, List[int]] = {}   # per card: last 3 readings, oldest first
         self._hold_log_pending = True
 
     @property
@@ -698,6 +707,7 @@ class PowerGovernor:
         self.max_w = list(self.hw_max_w)
         self._busy = [True] * len(self.handles)          # assume busy until measured
         self._quiet_since = [None] * len(self.handles)
+        self._last_busy_at = [time.monotonic()] * len(self.handles)
 
         dry = "  [DRY RUN — nothing will be set]" if self.dry_run else ""
         if self.budget_w is None:
@@ -745,6 +755,47 @@ class PowerGovernor:
     def _limit_for(self, i: int) -> float:
         """The limit card i should sit at, given its bounds and its cap."""
         return max(self.min_w[i], min(self.max_w[i], self.cap_w[i]))
+
+    def heat_state(self) -> Optional[str]:
+        """What adaptive's fans should know about power held back for heat:
+        "hold"       - a thermal hold while a card is busy;
+        "recovering" - walking back up while a busy card is still below its ceiling;
+        None         - normal.
+        In both held states adaptive's fans follow the base curve (temperature only) and
+        learn no quieter trim, which would otherwise keep the card at the target."""
+        n = len(self.handles)
+        busy = [i for i in range(n) if not self._busy or self._busy[i]]
+        if not busy:
+            return None
+        if self.thermal_limited:
+            return "hold"
+        if self.recovery_walk and self.cap_w and any(
+                self.cap_w[i] < self._ceil_w(i) - 0.5 for i in busy):
+            return "recovering"
+        return None
+
+    def _reset_idle_caps(self, now: float):
+        """With a total: a card idle for POWER_IDLE_DWELL_S and cooled below the release
+        point gets its cap back to its ceiling. The cuts it collected while busy belong to a
+        workload that's gone, and the total bounds it when it wakes. (Without a total the
+        UPS budget's behaviour is unchanged: only the all-idle reset.)"""
+        if (self.total_w is None or not self.cap_w or self.emergency_active
+                or self.blind_active or self._was_power_floor):
+            return
+        release_c = (self._target_c - THERMAL_POWER_RECOVER_MARGIN_C
+                     if self._target_c is not None else None)
+        for i in range(len(self.handles)):
+            if self._busy[i] or now - self._last_busy_at[i] < POWER_IDLE_DWELL_S:
+                continue
+            if self.cap_w[i] >= self._ceil_w(i) - 0.5:
+                continue
+            temp_c = self._card_temp(i)
+            if release_c is not None and temp_c is not None and temp_c > release_c:
+                continue
+            self.cap_w[i] = self._ceil_w(i)
+            log.info(f"POWER: GPU {i} idle for {now - self._last_busy_at[i]:.0f}s"
+                     + (f" at {temp_c}C" if temp_c is not None else "")
+                     + f" -> its earlier cuts cleared (cap {self.cap_w[i]:.0f} W)")
 
     def _hot_cards(self, temps: Optional[Dict[int, int]], trigger_c: int) -> List[int]:
         """The cards a thermal cut applies to: every card at or over the cut point, and the
@@ -846,15 +897,42 @@ class PowerGovernor:
         log.info(f"POWER: no ceiling and no UPS budget ({source}) — GPUs at their "
                  "default limit " + "/".join(f"{w:.0f}" for w in self.applied_w) + "W")
 
-    def raise_step_w(self, level_w: Optional[float] = None) -> float:
-        """How much one upward step may add to a card at `level_w`: exponential in degrees
-        below the release point, at most THERMAL_POWER_MAX_STEP_FRACTION of its level."""
+    def _card_climbing(self, i: int) -> bool:
+        """Card i is warmer than two readings ago: the same "climbing" the cut uses."""
+        recent = self._card_recent.get(i, [])
+        return len(recent) >= 3 and recent[-1] > recent[-3]
+
+    def _thermal_room(self, i: int) -> bool:
+        """May card i take power back now? Not while it's still warming up from the last
+        step (climbing): wait for it to settle. With adaptive, also only while it's below
+        the target (its fans aren't at their max yet); at the target the walk pauses. The
+        fixed curves' release already waited for target - 2."""
+        if self._card_climbing(i):
+            return False
+        if self._fan_threshold is None or self._target_c is None:
+            return True
+        temp_c = self._card_temp(i)
+        return temp_c is None or temp_c < self._target_c + THERMAL_POWER_MARGIN_C
+
+    def _card_temp(self, i: int) -> Optional[int]:
+        """Card i's last temperature; the hottest card's when per-card readings are missing."""
+        if self._last_temps and i in self._last_temps:
+            return self._last_temps[i]
+        return self._last_hottest_c
+
+    def raise_step_w(self, level_w: Optional[float] = None,
+                     temp_c: Optional[int] = None) -> float:
+        """How much one upward step may add to a card at `level_w` and `temp_c` (default:
+        the hottest card): exponential in degrees below the release point, at most
+        THERMAL_POWER_MAX_STEP_FRACTION of its level. Per card, so a cool card comes back
+        fast even while the other one sits near the target."""
         if level_w is None:
             level_w = self.learned_cap_w
+        hot_c = temp_c if temp_c is not None else self._last_hottest_c
         if (self._conservative_recovery or self._target_c is None
-                or self._last_hottest_c is None or level_w is None):
+                or hot_c is None or level_w is None):
             return POWER_SLEW_UP_W
-        below_c = (self._target_c - THERMAL_POWER_RECOVER_MARGIN_C) - self._last_hottest_c
+        below_c = (self._target_c - THERMAL_POWER_RECOVER_MARGIN_C) - hot_c
         if below_c <= 0:
             return POWER_SLEW_UP_W
         step = POWER_SLEW_UP_W * (2 ** min(below_c, 16))
@@ -871,12 +949,14 @@ class PowerGovernor:
             return False
         steps = []
         for i in range(n):
-            if self.cap_w[i] >= self._base_w(i) - 0.5:
+            if self.cap_w[i] >= self._base_w(i) - 0.5 or not self._thermal_room(i):
                 continue
-            step = self.raise_step_w(self.cap_w[i])
+            step = self.raise_step_w(self.cap_w[i], self._card_temp(i))
             steps.append(step)
             self.cap_w[i] = min(self._base_w(i), self.cap_w[i] + step)
             self._set_limit(i, self._limit_for(i))
+        if not steps:
+            return False                # every card still short of it sits at the target
         self._last_limit_change = now
         log.info(f"POWER: recovering after a hold, +{max(steps):.0f} W -> "
                  + "/".join(f"{w:.0f}" for w in self.applied_w) + "W")
@@ -1034,21 +1114,15 @@ class PowerGovernor:
         for i in range(len(self.handles)):
             self._set_limit(i, self._limit_for(i))
 
-    def _shares(self, busy: List[bool]) -> List[float]:
-        """Split the total: idle cards at their minimum, the busy ones water-filled up to
-        their own ceiling. All busy or all idle: everyone shares."""
-        n = len(self.handles)
-        sharers = [i for i in range(n) if busy[i]]
-        if not sharers or len(sharers) == n:
-            sharers = list(range(n))
-        shares = list(self.min_w)
-        amount = self.total_w - sum(self.min_w[i] for i in range(n) if i not in sharers)
-        lows = [self.min_w[i] for i in sharers]
-        # a card held below its fair share by its own cap (a thermal or UPS cut) can't use
-        # the rest, so the water-fill hands it to the other busy cards
-        highs = [max(self.min_w[i], min(self._ceil_w(i), self.cap_w[i]) if self.cap_w
-                     else self._ceil_w(i)) for i in sharers]
+    def _share_high(self, i: int) -> float:
+        """The most card i can take: its own ceiling, and below that its cap (a thermal or
+        UPS cut). What it can't use goes to the other cards."""
+        high = min(self._ceil_w(i), self.cap_w[i]) if self.cap_w else self._ceil_w(i)
+        return max(self.min_w[i], high)
 
+    @staticmethod
+    def _water_fill(amount: float, lows: List[float], highs: List[float]) -> List[float]:
+        """Share `amount` equally, each part between its low and high; whole watts, down."""
         def filled(level: float) -> float:
             return sum(min(h, max(lo, level)) for lo, h in zip(lows, highs))
 
@@ -1063,8 +1137,29 @@ class PowerGovernor:
                 else:
                     hi_level = mid
             level = lo_level
-        for k, i in enumerate(sharers):
-            shares[i] = float(int(min(highs[k], max(lows[k], level))))   # whole watts, rounded down
+        return [float(int(min(h, max(lo, level)))) for lo, h in zip(lows, highs)]
+
+    def _shares(self, busy: List[bool]) -> List[float]:
+        """Split the total. The busy cards share it first, each up to what it can take;
+        what they can't use goes to the idle cards ahead of time, so a card that wakes up
+        already has it (the busy cards take it back, lower before raise, when they can use
+        it again). All busy or all idle: everyone shares."""
+        n = len(self.handles)
+        sharers = [i for i in range(n) if busy[i]]
+        if not sharers or len(sharers) == n:
+            sharers = list(range(n))
+        idle = [i for i in range(n) if i not in sharers]
+        shares = list(self.min_w)
+        amount = self.total_w - sum(self.min_w[i] for i in idle)
+        for i, w in zip(sharers, self._water_fill(amount, [self.min_w[i] for i in sharers],
+                                                  [self._share_high(i) for i in sharers])):
+            shares[i] = w
+        leftover = self.total_w - sum(shares)
+        if idle and leftover >= 1.0:
+            amount = sum(self.min_w[i] for i in idle) + leftover
+            for i, w in zip(idle, self._water_fill(amount, [self.min_w[i] for i in idle],
+                                                   [self._share_high(i) for i in idle])):
+                shares[i] = w
         return shares
 
     def _note_activity(self, busy_now: List[bool], now: float):
@@ -1073,6 +1168,8 @@ class PowerGovernor:
             if busy_now[i]:
                 self._busy[i] = True
                 self._quiet_since[i] = None
+                if i < len(self._last_busy_at):
+                    self._last_busy_at[i] = now
             elif self._busy[i]:
                 if self._quiet_since[i] is None:
                     self._quiet_since[i] = now
@@ -1093,12 +1190,14 @@ class PowerGovernor:
         """Move the total to the busy cards. Lower before raise: in a tick that lowers any
         card's share, raises wait for the next tick, so the limits never add up to more
         than the total, even while a card is still obeying a lower limit."""
-        if self.total_w is None or not self.handles:
+        if not self.handles:
             return
         n = len(self.handles)
         if refresh:
             reading = self._read_activity()
             self._note_activity(reading[1] if reading is not None else [True] * n, now)
+        if self.total_w is None:
+            return
         want = self._shares(self._busy)
         old = self.alloc_w if self.alloc_w is not None else list(self.max_w)
         lowering = [i for i in range(n) if want[i] < old[i] - 0.5]
@@ -1188,6 +1287,10 @@ class PowerGovernor:
         both inputs react.
         """
         self._last_hottest_c = hottest_c
+        self._last_temps = dict(temps) if temps else None
+        for i, t in (temps or {}).items():
+            self._card_recent[i] = (self._card_recent.get(i, []) + [t])[-3:]
+        self._fan_threshold = fan_threshold
         self._target_c = target_c
         now = time.monotonic()
         self._recent_c = (self._recent_c + [hottest_c])[-3:]
@@ -1281,20 +1384,27 @@ class PowerGovernor:
         if not self.thermal_limited:
             self._thermal_cool_since = None
             return
-        release_c = target_c - THERMAL_POWER_RECOVER_MARGIN_C
+        adaptive = fan_threshold is not None
+        if adaptive:            # any degree below the target: the fans have room again
+            release_c = trigger_c - 1
+            dwell_s = THERMAL_ADAPTIVE_RELEASE_DWELL_S
+        else:
+            release_c = target_c - THERMAL_POWER_RECOVER_MARGIN_C
+            dwell_s = THERMAL_POWER_RECOVER_DWELL_S
         if hottest_c <= release_c:
             if self._thermal_cool_since is None:
                 self._thermal_cool_since = now
                 return
             cool_for = now - self._thermal_cool_since
-            if cool_for >= THERMAL_POWER_RECOVER_DWELL_S:
+            if cool_for >= dwell_s:
                 self.thermal_limited = False
                 self._thermal_cool_since = None
                 self._last_cut_temp_c = None
                 self.recovery_walk = True
                 self._last_limit_change = now
-                log.info(f"THERMAL: {hottest_c}C <= {release_c}C for {cool_for:.0f}s -> "
-                         "thermal hold cleared; power walks back up")
+                log.info(f"THERMAL: {hottest_c}C <= {release_c}C for {cool_for:.0f}s"
+                         + (" (adaptive: below the target, the fans have room)" if adaptive
+                            else "") + " -> thermal hold cleared; power walks back up")
         else:
             self._thermal_cool_since = None
 
@@ -1341,6 +1451,7 @@ class PowerGovernor:
         now = time.monotonic()
         # the total is moved every fan tick from NVML (no lag), not on the UPS interval
         self._allocate(now)
+        self._reset_idle_caps(now)
         if not force and (now - self._last_run) < self.interval:
             return
         self._last_run = now
@@ -1502,13 +1613,18 @@ class PowerGovernor:
                 return
             headroom_w = (self.budget_w - POWER_RESTORE_MARGIN_W) - total_w
             if self.recovery_walk:
-                # recovering after a thermal hold: the exponential step, bounded by headroom
-                raise_w = max(POWER_SLEW_UP_W, min(self.raise_step_w(max(levels)),
-                                                   headroom_w / max(1, active_gpu_count)))
+                # recovering after a thermal hold: each card's exponential step (from its own
+                # temperature), bounded by the measured headroom
+                per_card_w = headroom_w / max(1, active_gpu_count)
+                raises = [max(POWER_SLEW_UP_W,
+                              min(self.raise_step_w(levels[i], self._card_temp(i)), per_card_w))
+                          if self._thermal_room(i) else 0.0
+                          for i in range(n)]
             else:
-                raise_w = POWER_SLEW_UP_W       # a UPS-budget trim restores slowly (#2)
-            # each card below its own bound raises its cap by the step
-            targets = [min(self._ceil_w(i), self.cap_w[i] + raise_w)
+                raises = [POWER_SLEW_UP_W] * n  # a UPS-budget trim restores slowly (#2)
+            raise_w = max(raises)
+            # each card below its own bound raises its cap by its step
+            targets = [min(self._ceil_w(i), self.cap_w[i] + raises[i])
                        if self.cap_w[i] < self._ceil_w(i) - 0.5 else self.cap_w[i]
                        for i in range(n)]
             self._headroom_ticks = 0
@@ -1947,13 +2063,28 @@ class FanController:
                         if s is not None]
             self._commanded_fan_pct = min(fan_max, max(measured)) if measured else min(fan_max, base)
 
+        # While power is held back for heat (the hold, and the walk back up), the fans just
+        # follow temperature (the base curve) and no quieter trim is learned: a trim would
+        # keep the card sitting at the target and starve the recovery (seen on pve-ai: trim
+        # -26%, fans ~75%, power stuck at 150-235 W). Power comes back while the card is
+        # below the target (adaptive release, see observe_thermal), and the fans rise with it. Otherwise the fans
+        # quiet down just enough to keep the card near the target, and the hold, released
+        # at target - 2 for 30 s, never lets go (seen on pve-ai: trim -26%, fans ~75%, the
+        # card at 58-60 C, power stuck at 150-235 W with budget to spare).
+        heat = self.governor.heat_state()
         error_c = hottest - self.target
-        if -TARGET_TRACKING_BAND_C <= error_c < 0:
-            self._target_trim_pct -= (-error_c * TARGET_TRIM_DOWN_PCT_PER_C_S * self.poll_interval)
-        elif error_c > 0:
-            self._target_trim_pct += (error_c * TARGET_TRIM_UP_PCT_PER_C_S * self.poll_interval)
-        self._target_trim_pct = max(TARGET_TRIM_MIN_PCT, min(0.0, self._target_trim_pct))
-        demand = round(max(TARGET_FAN_MIN_PCT, min(fan_max, base + self._target_trim_pct)))
+        if heat is not None:
+            self._target_trim_pct = 0.0
+            demand = round(max(TARGET_FAN_MIN_PCT, min(fan_max, base)))
+        else:
+            if -TARGET_TRACKING_BAND_C <= error_c < 0:
+                self._target_trim_pct -= (-error_c * TARGET_TRIM_DOWN_PCT_PER_C_S
+                                          * self.poll_interval)
+            elif error_c > 0:
+                self._target_trim_pct += (error_c * TARGET_TRIM_UP_PCT_PER_C_S
+                                          * self.poll_interval)
+            self._target_trim_pct = max(TARGET_TRIM_MIN_PCT, min(0.0, self._target_trim_pct))
+            demand = round(max(TARGET_FAN_MIN_PCT, min(fan_max, base + self._target_trim_pct)))
 
         emergency = hottest >= self.emergency_c
         if emergency:
@@ -1968,7 +2099,9 @@ class FanController:
             self._set_speed(gpu, command)
         log.info(f"target: hottest={hottest}C target={self.target}C "
                  f"base={base}% trim={self._target_trim_pct:+.1f}% demand={demand}% "
-                 f"command={command}% max={fan_max}%" + (" EMERGENCY" if emergency else ""))
+                 f"command={command}% max={fan_max}%" + (" EMERGENCY" if emergency else "")
+                 + ({"hold": " HOLD: no quiet trim", "recovering": " RECOVERING: no quiet trim"}
+                    .get(heat, "") if not emergency else ""))
         return command
 
     # ── runtime state ──

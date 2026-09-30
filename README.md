@@ -80,10 +80,18 @@ its speed. With a fixed curve, both cards run the curve at the hotter card's tem
   overshoot. On pve-ai this took the peak from 82 °C to exactly the 75 °C target.
 - **Hold while falling:** after a cut, no further cut while the card is still cooling. It's cut
   again only if it stops falling while still at or over the target.
-- **Release and recovery:** the hold is released at `target − 2 °C` for 30 s. Power then comes
-  back in steps every 30 s, **+20 W × 2^(°C below target − 2)**, at most +50% per step. A card
-  that has clearly cooled gets full power back in about a minute; one just under the line
-  creeps up +20 W at a time.
+- **Release and recovery:** with a fixed curve the hold is released at `target − 2 °C` for
+  30 s. With `adaptive` it's released once the card is **below the target for 10 s**, because
+  its fans then aren't at their max yet, so there's room. Power then comes back in steps every
+  30 s, **+20 W × 2^(°C below target − 2)**, at most +50% per step, **each card sized by its own
+  temperature**. A card that has clearly cooled gets full power back in about a minute; one
+  just under the line creeps up +20 W at a time.
+- **A step waits while the card is still warming up** (warmer than two readings ago, the same
+  "climbing" the cut uses). With `adaptive` the walk also pauses while the card is at the
+  target, where a cut would follow.
+- **During a hold and the walk back up, `adaptive`'s fans just follow temperature** (their base
+  curve) and learn no quieter trim. The trim would keep the card sitting at the target and
+  starve the recovery (seen on pve-ai: fans at ~75%, power stuck with budget to spare).
 
 | Profile | Power is cut when |
 |---|---|
@@ -119,16 +127,21 @@ A per-GPU ceiling is a hard bound, but it caps a lone busy card as tightly as tw
 ones. The **total ceiling** bounds the sum instead, and the governor moves it to whichever
 cards are busy, reading each card's draw and utilization from NVML every 2 s (no lag):
 
-- **Idle cards** (≤ 75 W and ≤ 5% for 10 s) get their minimum, 150 W. The **busy** cards
-  share the rest equally, up to their own per-GPU ceiling. If all the cards are busy, or all
-  are idle, they split it equally.
+- The **busy** cards share the total equally, each up to what it can take (its per-GPU
+  ceiling, and below that its own temperature or UPS cut). **Idle cards** (≤ 75 W and ≤ 5% for
+  10 s) get their minimum, 150 W, **plus whatever the busy cards can't use, ahead of time**, so
+  it's there when they wake. If all the cards are busy, or all are idle, they split it equally.
 - **Lower before raise.** When the split changes, the cards losing power are lowered first,
   and the others are raised a tick (2 s) later. So the limits never add up to more than the
   total, even for a moment.
 - **A card that wakes up gets its share at once**, limited only by a real UPS or temperature
   cut, not by the 150 W it idled at.
 - **A card held below its share by its own cut** (too hot, or a UPS trim) leaves the rest to
-  the other busy cards, still within the total.
+  the other cards, still within the total.
+- **Old cuts don't follow an idle card.** A card idle for 60 s and cooled below the release
+  point gets its cap back to its ceiling. The cuts it collected while busy belong to a
+  workload that has gone. This happens only with a total, which is what bounds the card when
+  it wakes.
 
 With `750` on pve-ai, one busy card runs at 600 W while the other idles at 150 W, and two busy
 cards get ~375 W each. Unlike the UPS budget, the total holds however fast the load arrives,
