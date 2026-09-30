@@ -148,7 +148,16 @@ THERMAL_POWER_MARGIN_C = 0            # the cut point is the target itself
 THERMAL_POWER_INITIAL_DWELL_S = 5.0
 THERMAL_POWER_REPEAT_DWELL_S = 5.0
 THERMAL_POWER_MIN_STEP_W = 30.0
-THERMAL_POWER_MAX_STEP_FRACTION = 0.5
+THERMAL_POWER_MAX_STEP_FRACTION = 0.5        # the most a RECOVERY step may add
+# A smarter measured cut (operator, 2026-09-30): under vLLM a one-reading spike (84 -> 90 ->
+# 80 C) halved GPU1's power, 560 -> 280 W. A measured cut is now sized from the average of the
+# last two readings (a single spike counts half), it takes at most THERMAL_CUT_MAX_FRACTION
+# of a card's power per step, and it goes no lower than the card's last proven level (the
+# most recent power it held below the target for THERMAL_PROVEN_DWELL_S while drawing at
+# least THERMAL_PROVEN_DRAW_FRACTION of its limit) when the card overheats above that level.
+THERMAL_CUT_MAX_FRACTION = 0.25
+THERMAL_PROVEN_DWELL_S = 20.0
+THERMAL_PROVEN_DRAW_FRACTION = 0.9
 THERMAL_POWER_SKIP_DWELL_EXCESS_C = 4 # target+4 C or more: no grace
 # Rate of rise (operator, 2026-09-29). Measured PER READING, not per second: readings are
 # nominally 2 s apart but really ~2.05 s, so a per-second threshold of 1.0 C/s silently
@@ -723,6 +732,8 @@ class PowerGovernor:
         self._settle_pending = False    # full shares after a restart, once the UPS reads fine
         self._settle_now = False
         self._card_recent: Dict[int, List[int]] = {}   # per card: last 3 readings, oldest first
+        self._good_w: Dict[int, float] = {}            # per card: the last proven level
+        self._steady: Dict[int, Tuple[float, float]] = {}   # per card: (level, since)
         self._hold_log_pending = True
 
     @property
@@ -836,6 +847,7 @@ class PowerGovernor:
             if release_c is not None and temp_c is not None and temp_c > release_c:
                 continue
             self.cap_w[i] = self._ceil_w(i)
+            self._good_w.pop(i, None)
             log.info(f"POWER: GPU {i} idle for {now - self._last_busy_at[i]:.0f}s"
                      + (f" at {temp_c}C" if temp_c is not None else "")
                      + f" -> its earlier cuts cleared (cap {self.cap_w[i]:.0f} W)")
@@ -939,6 +951,30 @@ class PowerGovernor:
         self.cap_w = list(self.default_w)
         log.info(f"POWER: no ceiling and no UPS budget ({source}) — GPUs at their "
                  "default limit " + "/".join(f"{w:.0f}" for w in self.applied_w) + "W")
+
+    def _track_proven(self, now: float, target_c: Optional[int]):
+        """Remember each card's last proven level: the power limit it held below the target
+        for THERMAL_PROVEN_DWELL_S while drawing close to it (so a light load doesn't
+        count). A measured cut above that level goes no lower than it in one step."""
+        if target_c is None or not self.applied_w:
+            return
+        for i in range(len(self.handles)):
+            temp_c = self._card_temp(i)
+            hist = self._draw_hist[i] if i < len(self._draw_hist) else []
+            draw_w = hist[-1][1] if hist else None
+            level = self.applied_w[i]
+            proving = (temp_c is not None and temp_c < target_c + THERMAL_POWER_MARGIN_C
+                       and draw_w is not None
+                       and draw_w >= THERMAL_PROVEN_DRAW_FRACTION * level
+                       and not (self.emergency_active or self.blind_active))
+            if not proving:
+                self._steady.pop(i, None)
+                continue
+            held = self._steady.get(i)
+            if held is None or abs(held[0] - level) > 0.5:
+                self._steady[i] = (level, now)
+            elif now - held[1] >= THERMAL_PROVEN_DWELL_S:
+                self._good_w[i] = level
 
     def _card_climbing(self, i: int) -> bool:
         """Card i is warmer than two readings ago: the same "climbing" the cut uses."""
@@ -1392,6 +1428,7 @@ class PowerGovernor:
         for i, t in (temps or {}).items():
             self._card_recent[i] = (self._card_recent.get(i, []) + [t])[-3:]
         self._fan_threshold = fan_threshold
+        self._track_proven(time.monotonic(), target_c)
         self._target_c = target_c
         now = time.monotonic()
         self._recent_c = (self._recent_c + [hottest_c])[-3:]
@@ -1454,12 +1491,26 @@ class PowerGovernor:
             self._refresh_busy(now)
             hot = self._hot_cards(temps, trigger_c)
             levels = [self._cut_base(i) for i in range(len(self.handles))]
+            if predictive:
+                size_excess_c = excess_c        # already bounded (+2C at most)
+            else:
+                # measured: the average of the last two readings, so a one-reading spike
+                # counts half
+                recent = self._recent_c
+                avg_c = (recent[-1] + recent[-2]) / 2.0 if len(recent) >= 2 else hottest_c
+                size_excess_c = max(0, int(avg_c - trigger_c))
             step_w = max(THERMAL_POWER_MIN_STEP_W,
-                         min(THERMAL_POWER_MIN_STEP_W * (2 ** excess_c),
-                             THERMAL_POWER_MAX_STEP_FRACTION * max(levels[i] for i in hot)))
+                         min(THERMAL_POWER_MIN_STEP_W * (2 ** size_excess_c),
+                             THERMAL_CUT_MAX_FRACTION * max(levels[i] for i in hot)))
+            floored = []
             for i in hot:
-                cut = min(step_w, THERMAL_POWER_MAX_STEP_FRACTION * levels[i])
-                self.cap_w[i] = max(self.min_w[i], levels[i] - max(THERMAL_POWER_MIN_STEP_W, cut))
+                cut = min(step_w, THERMAL_CUT_MAX_FRACTION * levels[i])
+                new_w = max(self.min_w[i], levels[i] - max(THERMAL_POWER_MIN_STEP_W, cut))
+                good_w = self._good_w.get(i)
+                if good_w is not None and good_w < levels[i] - 0.5 and new_w < good_w:
+                    new_w = good_w          # no lower than its last proven level in one step
+                    floored.append(i)
+                self.cap_w[i] = new_w
                 self._lower_to(i, self._limit_for(i))
             if not self.thermal_limited:
                 self.thermal_holds += 1     # a new hold: adaptive's unlearning counts these
@@ -1482,8 +1533,12 @@ class PowerGovernor:
                    else f"for {hot_for:.0f}s")
             which = ("" if len(hot) == len(self.handles)
                      else " on GPU " + ",".join(str(i) for i in hot))
+            sized = ("" if predictive or size_excess_c == excess_c
+                     else f", sized for +{size_excess_c}C on the last two readings")
+            floor = ("" if not floored else " (no lower than its last proven "
+                     + "/".join(f"{self._good_w[i]:.0f}" for i in floored) + " W)")
             log.warning(f"⚠ THERMAL: {hottest_c}C{fans}, {why} (target {target_c}C, "
-                        f"+{excess_c}C over) -> -{step_w:.0f} W{which}, power cap "
+                        f"+{excess_c}C over{sized}) -> -{step_w:.0f} W{which}{floor}, power cap "
                         + "/".join(f"{w:.0f}" for w in self.applied_w) + " W")
             if (all(self.cap_w[i] <= self.min_w[i] + 0.5 for i in hot)
                     and hottest_c >= trigger_c):

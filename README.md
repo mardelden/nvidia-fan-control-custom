@@ -71,13 +71,22 @@ its speed. With a fixed curve, both cards run the curve at the hotter card's tem
 
 **Power is cut when the card reaches the target**, and harder the further over it is:
 
-| Card vs target | Cut |
+| Card vs target (average of the last two readings) | Cut |
 |---|---|
 | at the target | −30 W |
 | +1 °C | −60 W |
 | +2 °C | −120 W |
-| +3 °C | −240 W |
-| +4 °C and up | −50% of current power (the largest single cut) |
+| +3 °C and up | 30 W × 2^excess, **at most 25% of current power per step** |
+
+- **The size comes from the average of the last two readings,** so a one-reading spike
+  counts half: 84 → 90 °C is sized as +2 (−120 W), not +5. The trigger is still the latest
+  reading, so the cut happens at once.
+- **No lower than the card's last proven level in one step.** The daemon remembers each
+  card's most recent power that it held below the target for 20 s while drawing at least 90%
+  of its limit. A card that overheats above that level is cut no lower than it. At or below
+  it, the normal step applies. The proven level is forgotten when the card goes idle.
+- (First version: +4 °C and up cut **50%** in one step, sized from the latest reading alone.
+  Under vLLM one 90 °C spike halved GPU1, 560 → 280 W; changed 2026-09-30.)
 
 - **Grace:** a card that's **steady** at the target gets 5 s before the first cut, so a brief
   touch isn't punished. A card that's **still climbing** (warmer than two readings ago) is cut
