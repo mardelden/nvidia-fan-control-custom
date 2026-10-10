@@ -55,22 +55,30 @@ trim that pulls the fans down to the quietest speed that still holds the target.
 learns downward slowly, holds at the target, and unwinds fast if the card gets hotter. What
 it has learned survives a restart.
 
+**Per card.** Each card runs its own ramp from its own temperature and learns its own trim and
+floor (below). A cool card's fans stay slow while the other card works. A card whose power is
+held back for heat stops learning a quiet trim, and the other card carries on. Until
+2026-10-10 adaptive treated both cards as one zone: with mirror off, a 58 °C card still ran
+the 69 °C card's 84%.
+
 **Up at once, down gently.** Like the fixed curves, adaptive's fans go straight **up** to what
 the curve (plus trim) asks for, and ease **down** by 2% a reading. They used to climb +10% a
 reading, and a vLLM burst after a lull outran them (63 → 86 °C in 8 s while the fans went
 46 → 90%).
 
 **It also unlearns.** Parked at the target with quiet fans, a bursty load, such as vLLM, turns
-every burst into a power cut. So each power cut for heat raises a **floor under the trim** by
-20% (−50 → −30 → −10 → 0). A workload that keeps getting cut ends up with the fans on the
-base curve, ahead of the burst. Every 10 minutes without a cut lowers the floor by 5%, so a
-steady workload drifts back to quiet. The floor survives a restart and shows in
-`effective.json` as `adaptive_trim_floor_pct`.
+every burst into a power cut. So each power cut for heat raises a **floor under the trim** of
+the card that was cut, by 20% (−50 → −30 → −10 → 0). A workload that keeps getting cut ends up
+with that card's fans on the base curve, ahead of the burst. Every 10 minutes without a cut
+lowers the floor by 5%, so a steady workload drifts back to quiet. The floors survive a
+restart. `effective.json` lists them per card as `adaptive_trim_floor_pct`, beside the trims
+(`adaptive_trim_pct`) and the fan speeds (`fan_pct_by_card`).
 
-**Mirror** is for cards that share airflow (back to back): both fans follow the **hotter**
-card. With `native`, the hotter card stays on its factory curve and the cooler card copies
-its speed. With a fixed curve, both cards run the curve at the hotter card's temperature.
-`adaptive` always treats both cards as one zone.
+**Mirror** is for cards that share airflow (back to back), to guarantee the exhaust: both
+fans follow the **hotter** card. With `native`, the hotter card stays on its factory curve and
+the cooler card copies its speed. With a fixed curve, both cards run the curve at the hotter
+card's temperature. With `adaptive`, every card runs the **fastest** card's speed, while each
+card still learns its own trim. Mirror off: every profile drives each card on its own.
 
 ### How the temperature target is held
 

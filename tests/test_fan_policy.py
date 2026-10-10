@@ -405,7 +405,8 @@ check("adaptive:50 accepted with a target", ctl.profile == nfc.FanProfile("adapt
 set_temp(86, 60)
 tick(ctl, 10)
 check("fans never exceed the fan max", max(f for _, f in nv.FAN_CALLS) <= 50, nv.FAN_CALLS[-4:])
-check("fans reach the fan max under heat", fans() == [50, 50], fans())
+check("fans reach the fan max under heat on the hot card; the 60C card follows its own "
+      "temperature (mirror off)", fans() == [50, 30], fans())
 check("power cut on the hot card once fans >= max; the 60C card is not cut",
       limits()[0] < 600.0 and limits()[1] == 600.0, limits())
 
@@ -422,7 +423,8 @@ set_temp(93, 60)
 ctl2, *_ = (ctl,)
 ctl.profile = nfc.FanProfile("adaptive", 50)
 tick(ctl, 1)
-check("emergency forces 100% even above adaptive's fan max", fans() == [100, 100], fans())
+check("emergency forces 100% on the hot card even above adaptive's fan max (mirror off: the "
+      "60C card follows its own temperature)", fans()[0] == 100 and fans()[1] < 100, fans())
 
 print("\n== adaptive fans jump up to the curve, and ease down (operator, 2026-09-30) ==")
 # pve-ai 03:16:58: after a lull the fans were at 46%; a vLLM burst took GPU1 63 -> 78 -> 86C
@@ -444,7 +446,7 @@ print("\n== adaptive learns downward below the target, never below the floor =="
 ctl, gov, store, state, run = rig(saved={"profile": "adaptive", "target": "80"})
 set_temp(76, 60)
 tick(ctl, 60)
-check("trim learned downward", ctl._target_trim_pct < 0, ctl._target_trim_pct)
+check("trim learned downward", ctl._trim(0) < 0, ctl._target_trim_pct)
 check("never below the 30% floor", min(fans()) >= nfc.TARGET_FAN_MIN_PCT, fans())
 
 print("\n== clearing the target while adaptive -> native ==")
@@ -561,24 +563,27 @@ print("\n== runtime state survives a restart ==")
 ctl, gov, store, state, run = rig(saved={"profile": "adaptive", "target": "80"})
 set_temp(76, 60)
 tick(ctl, 40)
-learned = ctl._target_trim_pct
+learned = ctl._trim(0)
 ctl.save_runtime_state(force=True)
 doc = json.load(open(os.path.join(state, nfc.RUNTIME_STATE_FILE)))
-check("trim saved with its target (and the unlearning floor)",
-      doc["adaptive"] == {"target_c": 80, "trim_pct": round(learned, 2), "trim_floor_pct": -50.0},
-      doc)
+check("trim saved per card with its target (and the unlearning floor); the single values are the "
+      "least quiet card's, for a rollback",
+      doc["adaptive"] == {"target_c": 80, "trim_pct": 0.0, "trim_floor_pct": -50.0,
+                          "by_card": {"trim_pct": [round(learned, 2), 0.0],
+                                      "trim_floor_pct": [-50.0, -50.0]}}, doc)
 store2 = nfc.SettingsStore(state, run, {})
 gov2 = nfc.PowerGovernor(handles=[], interval=5.0)
 ctl2 = nfc.FanController(store2, gov2, emergency_c=92, state_dir=state, run_dir=run)
 ctl2.init()
-check("trim restored after restart", abs(ctl2._target_trim_pct - round(learned, 2)) < 0.01,
+check("trim restored per card after restart",
+      abs(ctl2._trim(0) - round(learned, 2)) < 0.01 and ctl2._trim(1) == 0.0,
       ctl2._target_trim_pct)
 write(state, "target", "78")
 store3 = nfc.SettingsStore(state, run, {})
 ctl3 = nfc.FanController(store3, nfc.PowerGovernor(handles=[], interval=5.0), emergency_c=92,
                          state_dir=state, run_dir=run)
 ctl3.init()
-check("trim for a different target is not restored", ctl3._target_trim_pct == 0.0, ctl3._target_trim_pct)
+check("trim for a different target is not restored", ctl3._trim(0) == 0.0, ctl3._target_trim_pct)
 
 ctl, gov, store, state, run = rig(saved={"profile": "quiet"})
 set_temp(93, 60)
@@ -1039,7 +1044,7 @@ cut_w = limits()[0]
 set_temp(59, 45)                             # 1C under the target, not target-2
 run(ctl, 3)
 check("just under the target: the fans follow the curve (96%, not pinned), no quiet trim",
-      fans() == [96, 96] and ctl._target_trim_pct == 0.0, (fans(), ctl._target_trim_pct))
+      fans()[0] == 96 and ctl._trim(0) == 0.0, (fans(), ctl._target_trim_pct))
 run(ctl, 3)
 check("below the target for 10 s: the hold releases (no target-2 / 30 s wait for adaptive)",
       not gov.thermal_limited and gov.recovery_walk, (gov.thermal_limited, gov.recovery_walk))
@@ -1118,7 +1123,7 @@ busy_cards(True, False)
 set_temp(83, 45)
 run(ctl, 200)                                # a steady load just under the target: learns quiet
 check("steady just under the target: adaptive learns a deep quiet trim (floor -50)",
-      ctl._target_trim_pct < -20.0 and ctl._trim_floor_pct == -50.0,
+      ctl._trim(0) < -20.0 and ctl._floor(0) == -50.0,
       (ctl._target_trim_pct, ctl._trim_floor_pct))
 
 def burst(ctl):
@@ -1128,27 +1133,133 @@ def burst(ctl):
     set_temp(80, 45); run(ctl, 10)
 
 burst(ctl)
-check("first cut: the floor rises -50 -> -30", ctl._trim_floor_pct == -30.0 and gov.thermal_holds == 1,
+check("first cut: the floor rises -50 -> -30", ctl._floor(0) == -30.0 and gov.thermal_holds == 1,
       (ctl._trim_floor_pct, gov.thermal_holds))
+check("...on the cut card only: the idle card's floor stays -50",
+      ctl._floor(1) == -50.0 and gov.thermal_holds_by_card == {0: 1},
+      (ctl._trim_floor_pct, gov.thermal_holds_by_card))
 burst(ctl)
 burst(ctl)
-check("two more cuts: -30 -> -10 -> 0 (the base curve)", ctl._trim_floor_pct == 0.0,
+check("two more cuts: -30 -> -10 -> 0 (the base curve)", ctl._floor(0) == 0.0,
       ctl._trim_floor_pct)
 set_temp(83, 45)
 run(ctl, 150)                                # recovered, steady again just under the target
-check("at floor 0 no quiet trim is learned: the fans follow the base curve (90% at 83C)",
-      ctl._target_trim_pct == 0.0 and fans() == [90, 90], (ctl._target_trim_pct, fans()))
+check("at floor 0 no quiet trim is learned: the fans follow the base curve (90% at 83C; the "
+      "45C card at its own 30%)",
+      ctl._trim(0) == 0.0 and fans() == [90, 30], (ctl._target_trim_pct, fans()))
 CLOCK.advance(nfc.TRIM_FLOOR_RELAX_S)
 run(ctl, 1)
-check("10 cut-free minutes: the floor relaxes 0 -> -5", ctl._trim_floor_pct == -5.0,
+check("10 cut-free minutes: the floor relaxes 0 -> -5", ctl._floor(0) == -5.0,
       ctl._trim_floor_pct)
 ctl.save_runtime_state(force=True)
 doc = json.load(open(os.path.join(ctl.state_dir, nfc.RUNTIME_STATE_FILE)))
-check("the floor is saved with the trim", doc["adaptive"]["trim_floor_pct"] == -5.0, doc["adaptive"])
+check("the floor is saved with the trim, per card",
+      doc["adaptive"]["by_card"]["trim_floor_pct"] == [-5.0, -50.0]
+      and doc["adaptive"]["trim_floor_pct"] == -5.0, doc["adaptive"])
 ctl._write_effective()
 doc = json.load(open(os.path.join(ctl.run_dir, "effective.json")))
-check("...and published in effective.json", doc["adaptive_trim_floor_pct"] == -5.0,
-      doc.get("adaptive_trim_floor_pct"))
+check("...and published in effective.json, per card",
+      doc["adaptive_trim_floor_pct"] == [-5.0, -50.0], doc.get("adaptive_trim_floor_pct"))
+
+print("\n== adaptive per card: own fans, own quiet trim; mirror runs the fastest card's speed ==")
+# pve-ai 2026-10-10: mirror off, yet adaptive drove both cards at the hotter card's speed (58C
+# and 69C, both fans 84%): it treated the cards as one zone. Operator: per card, the learned
+# trim too; mirror is only for back-to-back cards, to guarantee the exhaust.
+ctl, gov, *_ = rig(saved={"profile": "adaptive", "target": "80", "mirror": "off"})
+set_temp(77, 79)
+tick(ctl, 20)
+check("mirror off: each card runs its own speed", fans()[0] < fans()[1], fans())
+check("...from its own quiet trim: the 77C card learns faster than the 79C one",
+      ctl._trim(0) < ctl._trim(1) < 0, ctl._target_trim_pct)
+set_temp(58, 69)
+tick(ctl, 40)
+check("the 2026-10-10 case (58C and 69C): the cooler card's fans run slower",
+      fans()[0] < fans()[1], fans())
+ctl._write_effective()
+doc = json.load(open(os.path.join(ctl.run_dir, "effective.json")))
+check("effective.json publishes each card's fan speed and trim",
+      doc["fan_pct_by_card"] == fans() and len(doc["adaptive_trim_pct"]) == 2,
+      (doc.get("fan_pct_by_card"), doc.get("adaptive_trim_pct")))
+
+# a cut holds back only the cut card: its fans follow the base curve, the other keeps its trim
+ctl, gov, *_ = rig(saved={"profile": "adaptive", "ceiling": "600", "target": "80"})
+busy_cards(True, True)
+set_temp(70, 78)
+run(ctl, 30, total=1e9)                          # GPU1 learns a quiet trim just under the target
+learned = ctl._trim(1)
+set_temp(84, 78)
+run(ctl, 6, total=1e9)
+check("GPU0 over the target is cut; GPU1 under it isn't",
+      gov.thermal_limited and limits()[0] < 600.0 and limits()[1] == 600.0, limits())
+check("per card: the cut card learns no trim (base curve); the other keeps learning",
+      gov.heat_state(0) == "hold" and gov.heat_state(1) is None
+      and ctl._trim(0) == 0.0 and ctl._trim(1) <= learned < 0,
+      (gov.heat_state(0), gov.heat_state(1), ctl._target_trim_pct, learned))
+ctl.save_runtime_state(force=True)
+doc = json.load(open(os.path.join(ctl.state_dir, nfc.RUNTIME_STATE_FILE)))
+check("the runtime state names the card held back for heat", doc["thermal"] == {
+      "limited": True, "cards": [0]}, doc["thermal"])
+ctl2 = nfc.FanController(nfc.SettingsStore(ctl.state_dir, ctl.run_dir, {}),
+                         nfc.PowerGovernor(handles=[], interval=5.0), emergency_c=92,
+                         state_dir=ctl.state_dir, run_dir=ctl.run_dir)
+ctl2.init()
+check("...and a restart restores the hold on that card only",
+      ctl2.governor.thermal_limited and ctl2.governor.heat_cards == {0}
+      and ctl2.governor.heat_state(1) is None, ctl2.governor.heat_cards)
+
+# mirror on: every card runs the fastest card's speed; each still learns its own trim
+ctl, gov, store, state, _ = rig(saved={"profile": "adaptive", "target": "80", "mirror": "on"})
+set_temp(77, 60)
+tick(ctl, 20)
+check("mirror on: the 60C card runs the 77C card's speed",
+      fans()[0] == fans()[1] == ctl._commanded_fan_pct[0] and fans()[0] > 30, fans())
+check("...while each card learns its own trim (the 60C card is out of the tracking band)",
+      ctl._trim(0) < 0 and ctl._trim(1) == 0.0, ctl._target_trim_pct)
+shared = fans()[1]
+write(state, "mirror", "off")
+tick(ctl, 1)
+check("mirror turned off: the cool card eases down 2% a reading from the shared speed",
+      fans()[1] == shared - 2, (shared, fans()))
+tick(ctl, 40)
+check("...to its own speed (30% at 60C)", fans()[1] == 30, fans())
+write(state, "mirror", "on")
+tick(ctl, 1)
+check("mirror back on: the cool card jumps to the fastest speed at once",
+      fans()[1] == fans()[0] > 30, fans())
+set_temp(93, 60)
+tick(ctl, 1)
+check("emergency with mirror: both cards 100%", fans() == [100, 100], fans())
+
+# an older runtime state (one trim for the zone, no held cards) restores to every card
+ctl, gov, store, state, rdir = rig(saved={"profile": "adaptive", "target": "80"})
+with open(os.path.join(state, nfc.RUNTIME_STATE_FILE), "w") as f:
+    json.dump({"saved_at": CLOCK.time(), "adaptive": {"target_c": 80, "trim_pct": -12.0,
+               "trim_floor_pct": -30.0}, "thermal": {"limited": True}}, f)
+ctl2 = nfc.FanController(nfc.SettingsStore(state, rdir, {}),
+                         nfc.PowerGovernor(handles=[], interval=5.0), emergency_c=92,
+                         state_dir=state, run_dir=rdir)
+ctl2.init()
+check("an older runtime state's single trim and floor restore to every card",
+      ctl2._target_trim_pct == {0: -12.0, 1: -12.0}
+      and ctl2._trim_floor_pct == {0: -30.0, 1: -30.0},
+      (ctl2._target_trim_pct, ctl2._trim_floor_pct))
+check("...and its thermal hold (cards unknown) holds every card back",
+      ctl2.governor.heat_cards == {0, 1}, ctl2.governor.heat_cards)
+
+# no GPUs: a trim saved for another target is kept for later, and saving it must not fail
+ctl, gov, store, state, rdir = rig(n=0, saved={"profile": "adaptive", "target": "78"})
+with open(os.path.join(state, nfc.RUNTIME_STATE_FILE), "w") as f:
+    json.dump({"saved_at": CLOCK.time(), "adaptive": {"target_c": 80, "trim_pct": -12.0,
+               "by_card": {"trim_pct": [-12.0, -4.0]}}}, f)
+ctl2 = nfc.FanController(nfc.SettingsStore(state, rdir, {}),
+                         nfc.PowerGovernor(handles=[], interval=5.0), emergency_c=92,
+                         state_dir=state, run_dir=rdir)
+ctl2.init()
+try:
+    ctl2.save_runtime_state(force=True)
+    check("0 GPUs: a pending trim saves without error", True)
+except Exception as e:
+    check("0 GPUs: a pending trim saves without error", False, e)
 
 print("\n== recovery per card: a cool card comes back fast while the other sits near the target ==")
 ctl, gov, *_ = rig(saved={"profile": "quiet", "ceiling": "600", "target": "60"}, budget=900)

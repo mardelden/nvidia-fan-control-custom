@@ -39,7 +39,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import pynvml
 
@@ -710,6 +710,9 @@ class PowerGovernor:
         self._conservative_recovery = False     # after an emergency: +20 W steps only
         self.thermal_limited = False
         self.thermal_holds = 0          # holds started (power cuts for heat), for adaptive
+        self.thermal_holds_by_card: Dict[int, int] = {}   # per card: the holds it was cut in
+        self._hold_cut_cards: Set[int] = set()            # cards cut in the current hold
+        self.heat_cards: Set[int] = set()   # cards whose power is held back for heat
         # temperature unreadable
         self.blind_active = False
         self._blind_ok_since: Optional[float] = None
@@ -812,21 +815,25 @@ class PowerGovernor:
         """The limit card i should sit at, given its bounds and its cap."""
         return max(self.min_w[i], min(self.max_w[i], self.cap_w[i]))
 
-    def heat_state(self) -> Optional[str]:
-        """What adaptive's fans should know about power held back for heat:
-        "hold"       - a thermal hold while a card is busy;
-        "recovering" - walking back up while a busy card is still below its ceiling;
+    def heat_state(self, card: int) -> Optional[str]:
+        """What adaptive's fans on `card` should know about power held back for heat:
+        "hold"       - a thermal hold while the card is busy;
+        "recovering" - walking back up while the busy card is still below its ceiling;
         None         - normal.
-        In both held states adaptive's fans follow the base curve (temperature only) and
-        learn no quieter trim, which would otherwise keep the card at the target."""
-        n = len(self.handles)
-        busy = [i for i in range(n) if not self._busy or self._busy[i]]
-        if not busy:
+        In both held states the card's fans follow the base curve (temperature only) and
+        learn no quieter trim, which would otherwise keep the card at the target. Only a card
+        whose own power is held back for heat counts: one that was cut, or every card under
+        an emergency or blind clamp. The other card keeps its quiet trim."""
+        if self.emergency_active or self.blind_active:
+            return "hold"
+        if self._busy and card < len(self._busy) and not self._busy[card]:
+            return None
+        if card not in self.heat_cards:
             return None
         if self.thermal_limited:
             return "hold"
-        if self.recovery_walk and self.cap_w and any(
-                self.cap_w[i] < self._ceil_w(i) - 0.5 for i in busy):
+        if (self.recovery_walk and card < len(self.cap_w)
+                and self.cap_w[card] < self._ceil_w(card) - 0.5):
             return "recovering"
         return None
 
@@ -1384,6 +1391,7 @@ class PowerGovernor:
             self.emergency_active = True
             self.recovery_walk = False
             self._conservative_recovery = True
+            self.heat_cards = set(range(len(self.handles)))
             self.clamp_all(min(self.min_w),
                            f"EMERGENCY: {hottest_c}C >= {emergency_c}C for {hot_for:.0f}s")
             log.warning(f"⚠ EMERGENCY: all GPUs at minimum power; released once <= "
@@ -1504,6 +1512,17 @@ class PowerGovernor:
             step_w = max(THERMAL_POWER_MIN_STEP_W,
                          min(THERMAL_POWER_MIN_STEP_W * (2 ** size_excess_c),
                              THERMAL_CUT_MAX_FRACTION * max(levels[i] for i in hot)))
+            if not self.thermal_limited:
+                # a new hold: count it per card as each card is first cut in it; a card from
+                # an earlier hold that is still below its ceiling stays held back for heat
+                self._hold_cut_cards = set()
+                self.heat_cards = {j for j in self.heat_cards
+                                   if j < len(self.cap_w) and self.cap_w[j] < self._ceil_w(j) - 0.5}
+            for i in hot:
+                if i not in self._hold_cut_cards:
+                    self._hold_cut_cards.add(i)
+                    self.thermal_holds_by_card[i] = self.thermal_holds_by_card.get(i, 0) + 1
+                self.heat_cards.add(i)
             floored = []
             for i in hot:
                 cut = min(step_w, THERMAL_CUT_MAX_FRACTION * levels[i])
@@ -1587,6 +1606,7 @@ class PowerGovernor:
                 self.blind_active = True
                 self.recovery_walk = False
                 self._conservative_recovery = True
+                self.heat_cards = set(range(len(self.handles)))
                 self.clamp_all(min(self.min_w), "BLIND: GPU temperature unreadable")
             for i in range(len(self.handles)):
                 self._set_limit(i, self.min_w[i])
@@ -1604,14 +1624,21 @@ class PowerGovernor:
             log.info("BLIND: temperatures readable again for "
                      f"{BLIND_RELEASE_DWELL_S:.0f}s -> cleared; power walks back up")
 
-    def restore_holds(self, thermal: bool, emergency: bool):
-        """Re-arm holds saved in the runtime state (a restart must not lift them)."""
+    def restore_holds(self, thermal: bool, emergency: bool,
+                      cards: Optional[List[int]] = None):
+        """Re-arm holds saved in the runtime state (a restart must not lift them). `cards`:
+        the cards held back for heat when it was saved; unknown (an older file) means all."""
+        everyone = set(range(len(self.handles)))
         if emergency:
             self.emergency_active = True
             self._conservative_recovery = True
+            self.heat_cards = everyone
             self.clamp_all(min(self.min_w), "EMERGENCY hold restored from runtime state")
         if thermal:
             self.thermal_limited = True
+            held = {i for i in (cards or []) if i in everyone}
+            self.heat_cards = self.heat_cards | (held or everyone)
+            self._hold_cut_cards = set(self.heat_cards)
             log.info("THERMAL: thermal hold restored from runtime state")
 
     # ── the UPS loop ──
@@ -1913,12 +1940,14 @@ class FanController:
         self._manual: Dict[int, Optional[bool]] = {}     # gpu -> policy we last set
         self._speed: Dict[int, int] = {}                  # gpu -> % we last set
         self._settle: Dict[int, bool] = {}                # gpu -> easing down after a switch
-        self._commanded_fan_pct: Optional[int] = None     # adaptive (one zone)
-        self._target_trim_pct = 0.0
-        self._pending_trim: Optional[Tuple[int, float]] = None
-        self._trim_floor_pct = TARGET_TRIM_MIN_PCT      # unlearning: raised by power cuts
-        self._seen_holds = 0
-        self._floor_changed_at = time.monotonic()
+        # adaptive, per card: each card learns its own quiet trim (and its unlearning floor)
+        self._commanded_fan_pct: Dict[int, int] = {}      # gpu -> % adaptive last commanded
+        self._target_trim_pct: Dict[int, float] = {}      # gpu -> learned quiet trim
+        self._pending_trim: Optional[Tuple[int, List[float]]] = None
+        self._trim_floor_pct: Dict[int, float] = {}       # gpu -> floor under the trim
+        self._seen_holds: Dict[int, int] = {}
+        self._floor_changed_at: Dict[int, float] = {}
+        self._created_at = time.monotonic()
         self.last_fan_pct: Optional[int] = None
         self.last_temps: Dict[int, int] = {}
         self.messages: List[str] = []
@@ -2049,14 +2078,14 @@ class FanController:
         self.profile = profile
         self._note(f"FAN: profile set to {profile.describe()} ({source})")
         if profile.name == "adaptive":
-            self._commanded_fan_pct = None     # re-seeded from the measured speed
+            self._commanded_fan_pct = {}       # re-seeded from the measured speeds
             if self._pending_trim and self._pending_trim[0] == self.target:
-                self._target_trim_pct = self._pending_trim[1]
+                self._target_trim_pct = dict(enumerate(self._pending_trim[1]))
                 log.info(f"FAN: adaptive trim restored from runtime state "
-                         f"({self._target_trim_pct:+.1f}%)")
+                         f"({self._trims_text()})")
             self._pending_trim = None
         elif leaving_adaptive:
-            self._target_trim_pct = 0.0
+            self._target_trim_pct = {}
         self._begin_switch()
 
     def _begin_switch(self):
@@ -2200,7 +2229,10 @@ class FanController:
         name = self.profile.name
 
         if name == "adaptive":
-            return self._update_adaptive(hottest), self.profile.fan_max
+            commands = self._update_adaptive(temps)
+            # the cut waits for the hottest card's own fans (the fastest of them, on a tie)
+            return (max(commands[g] for g in temps if temps[g] == hottest),
+                    self.profile.fan_max)
 
         if name == "native":
             if not self.mirror:
@@ -2257,83 +2289,105 @@ class FanController:
         ratio = (temp - approach_start) / TARGET_FAN_APPROACH_BAND_C
         return max(TARGET_FAN_MIN_PCT, min(100, round(TARGET_FAN_MIN_PCT + ratio * (100 - TARGET_FAN_MIN_PCT))))
 
-    def _unlearn(self):
-        """Adaptive learns from its own power cuts: each new thermal hold raises the floor
-        under the quiet trim; a cut-free TRIM_FLOOR_RELAX_S lowers it again."""
+    def _trim(self, gpu: int) -> float:
+        return self._target_trim_pct.get(gpu, 0.0)
+
+    def _floor(self, gpu: int) -> float:
+        return self._trim_floor_pct.get(gpu, TARGET_TRIM_MIN_PCT)
+
+    def _trims_text(self) -> str:
+        return " ".join(f"GPU{g} {t:+.1f}%" for g, t in sorted(self._target_trim_pct.items()))
+
+    def _unlearn(self, gpu: int):
+        """Adaptive learns from its own power cuts, per card: each hold that cuts this card
+        raises the floor under its quiet trim; a cut-free TRIM_FLOOR_RELAX_S lowers it again."""
         now = time.monotonic()
-        holds = self.governor.thermal_holds
-        if holds > self._seen_holds:
-            before = self._trim_floor_pct
-            self._trim_floor_pct = min(0.0, self._trim_floor_pct
-                                       + TRIM_FLOOR_RAISE_PCT * (holds - self._seen_holds))
-            self._seen_holds = holds
-            self._floor_changed_at = now
-            if self._trim_floor_pct != before:      # at 0 already: nothing new to say
-                log.info(f"FAN: adaptive unlearns after a power cut for heat: quiet trim floor "
-                         f"{before:+.0f}% -> {self._trim_floor_pct:+.0f}%"
-                         + (" (the fans now follow the base curve)"
-                            if self._trim_floor_pct >= 0.0 else ""))
-        elif (self._trim_floor_pct > TARGET_TRIM_MIN_PCT
-              and now - self._floor_changed_at >= TRIM_FLOOR_RELAX_S):
-            before = self._trim_floor_pct
-            self._trim_floor_pct = max(TARGET_TRIM_MIN_PCT,
-                                       self._trim_floor_pct - TRIM_FLOOR_RELAX_PCT)
-            self._floor_changed_at = now
-            log.info(f"FAN: adaptive, {TRIM_FLOOR_RELAX_S / 60:.0f} min without a power cut: "
-                     f"quiet trim floor {before:+.0f}% -> {self._trim_floor_pct:+.0f}%")
+        holds = self.governor.thermal_holds_by_card.get(gpu, 0)
+        seen = self._seen_holds.get(gpu, 0)
+        before = self._floor(gpu)
+        if holds > seen:
+            self._trim_floor_pct[gpu] = min(0.0, before + TRIM_FLOOR_RAISE_PCT * (holds - seen))
+            self._seen_holds[gpu] = holds
+            self._floor_changed_at[gpu] = now
+            if self._floor(gpu) != before:          # at 0 already: nothing new to say
+                log.info(f"FAN: adaptive unlearns after a power cut for heat on GPU {gpu}: "
+                         f"quiet trim floor {before:+.0f}% -> {self._floor(gpu):+.0f}%"
+                         + (" (its fans now follow the base curve)"
+                            if self._floor(gpu) >= 0.0 else ""))
+        elif (before > TARGET_TRIM_MIN_PCT
+              and now - self._floor_changed_at.get(gpu, self._created_at) >= TRIM_FLOOR_RELAX_S):
+            self._trim_floor_pct[gpu] = max(TARGET_TRIM_MIN_PCT, before - TRIM_FLOOR_RELAX_PCT)
+            self._floor_changed_at[gpu] = now
+            log.info(f"FAN: adaptive, {TRIM_FLOOR_RELAX_S / 60:.0f} min without a power cut on "
+                     f"GPU {gpu}: quiet trim floor {before:+.0f}% -> {self._floor(gpu):+.0f}%")
 
-    def _update_adaptive(self, hottest: int) -> int:
-        """The learning controller: hold the card AT the target, never above the fan max.
-        Both cards are one thermal zone (v1)."""
-        self._unlearn()
+    def _update_adaptive(self, temps: Dict[int, int]) -> Dict[int, int]:
+        """The learning controller, per card: hold each card AT the target with its own fans
+        and its own learned trim, never above the fan max. With mirror (back-to-back cards
+        sharing the exhaust), every card runs the fastest card's speed.
+        Returns the % commanded to each card."""
         fan_max = self.profile.fan_max
-        base = self.get_target_fan_demand(hottest)
-        if self._commanded_fan_pct is None:
-            measured = [s for s in (self._read_speed(g) for g in range(len(self.handles)))
-                        if s is not None]
-            self._commanded_fan_pct = min(fan_max, max(measured)) if measured else min(fan_max, base)
+        commands: Dict[int, int] = {}
+        parts = []
+        for gpu in sorted(temps):
+            temp = temps[gpu]
+            self._unlearn(gpu)
+            base = self.get_target_fan_demand(temp)
+            if gpu not in self._commanded_fan_pct:
+                measured = self._read_speed(gpu)
+                self._commanded_fan_pct[gpu] = min(fan_max, measured if measured is not None
+                                                   else base)
 
-        # While power is held back for heat (the hold, and the walk back up), the fans just
-        # follow temperature (the base curve) and no quieter trim is learned: a trim would
-        # keep the card sitting at the target and starve the recovery (seen on pve-ai: trim
-        # -26%, fans ~75%, power stuck at 150-235 W). Power comes back while the card is
-        # below the target (adaptive release, see observe_thermal), and the fans rise with it. Otherwise the fans
-        # quiet down just enough to keep the card near the target, and the hold, released
-        # at target - 2 for 30 s, never lets go (seen on pve-ai: trim -26%, fans ~75%, the
-        # card at 58-60 C, power stuck at 150-235 W with budget to spare).
-        heat = self.governor.heat_state()
-        error_c = hottest - self.target
-        if heat is not None:
-            self._target_trim_pct = 0.0
-            demand = round(max(TARGET_FAN_MIN_PCT, min(fan_max, base)))
-        else:
-            if -TARGET_TRACKING_BAND_C <= error_c < 0:
-                self._target_trim_pct -= (-error_c * TARGET_TRIM_DOWN_PCT_PER_C_S
-                                          * self.poll_interval)
-            elif error_c > 0:
-                self._target_trim_pct += (error_c * TARGET_TRIM_UP_PCT_PER_C_S
-                                          * self.poll_interval)
-            self._target_trim_pct = max(self._trim_floor_pct, min(0.0, self._target_trim_pct))
-            demand = round(max(TARGET_FAN_MIN_PCT, min(fan_max, base + self._target_trim_pct)))
+            # While this card's power is held back for heat (the hold, and the walk back up),
+            # its fans just follow temperature (the base curve) and no quieter trim is
+            # learned: a trim would keep the card sitting at the target and starve the
+            # recovery (seen on pve-ai: trim -26%, fans ~75%, power stuck at 150-235 W).
+            # Power comes back while the card is below the target (adaptive release, see
+            # observe_thermal), and the fans rise with it. Otherwise the fans quiet down just
+            # enough to keep the card near the target, and the hold, released at target - 2
+            # for 30 s, never lets go (seen on pve-ai: trim -26%, fans ~75%, the card at
+            # 58-60 C, power stuck at 150-235 W with budget to spare).
+            heat = self.governor.heat_state(gpu)
+            error_c = temp - self.target
+            trim = self._trim(gpu)
+            if heat is not None:
+                trim = 0.0
+                demand = round(max(TARGET_FAN_MIN_PCT, min(fan_max, base)))
+            else:
+                if -TARGET_TRACKING_BAND_C <= error_c < 0:
+                    trim -= -error_c * TARGET_TRIM_DOWN_PCT_PER_C_S * self.poll_interval
+                elif error_c > 0:
+                    trim += error_c * TARGET_TRIM_UP_PCT_PER_C_S * self.poll_interval
+                trim = max(self._floor(gpu), min(0.0, trim))
+                demand = round(max(TARGET_FAN_MIN_PCT, min(fan_max, base + trim)))
+            self._target_trim_pct[gpu] = trim
 
-        emergency = hottest >= self.emergency_c
-        if emergency:
-            command = 100
-        elif demand > self._commanded_fan_pct:
-            command = demand            # up: at once (the down side eases)
-        else:
-            command = max(demand, self._commanded_fan_pct - TARGET_FAN_SLEW_DOWN_PCT)
-        command = command if emergency else min(fan_max, command)
-        self._commanded_fan_pct = command
+            emergency = temp >= self.emergency_c
+            previous = self._commanded_fan_pct[gpu]
+            if emergency:
+                command = 100
+            elif demand > previous:
+                command = demand            # up: at once (the down side eases)
+            else:
+                command = max(demand, previous - TARGET_FAN_SLEW_DOWN_PCT)
+            commands[gpu] = command if emergency else min(fan_max, command)
+            parts.append(f"GPU{gpu} {temp}C base={base}% trim={trim:+.1f}% "
+                         f"(floor {self._floor(gpu):+.0f}%) demand={demand}% -> {commands[gpu]}%"
+                         + (" EMERGENCY" if emergency else
+                            {"hold": " HOLD: no quiet trim",
+                             "recovering": " RECOVERING: no quiet trim"}.get(heat, "")))
+
+        # a card with no reading yet runs the fastest card's speed (it might be the hot one)
+        fastest = max(commands.values())
+        if self.mirror:
+            commands = {g: fastest for g in commands}
         for gpu in range(len(self.handles)):
+            command = commands.setdefault(gpu, fastest)
+            self._commanded_fan_pct[gpu] = command
             self._set_speed(gpu, command)
-        log.info(f"target: hottest={hottest}C target={self.target}C "
-                 f"base={base}% trim={self._target_trim_pct:+.1f}% "
-                 f"(floor {self._trim_floor_pct:+.0f}%) demand={demand}% "
-                 f"command={command}% max={fan_max}%" + (" EMERGENCY" if emergency else "")
-                 + ({"hold": " HOLD: no quiet trim", "recovering": " RECOVERING: no quiet trim"}
-                    .get(heat, "") if not emergency else ""))
-        return command
+        log.info(f"target: {self.target}C max={fan_max}% " + "; ".join(parts)
+                 + (f"; mirror -> {fastest}%" if self.mirror else ""))
+        return commands
 
     # ── runtime state ──
     def _runtime_path(self) -> str:
@@ -2368,25 +2422,42 @@ class FanController:
         except (OSError, ValueError, TypeError, AttributeError):
             return None
 
+    def _per_card(self, by_card: dict, key: str, single) -> Optional[List[float]]:
+        """A per-card value from the runtime state: the `by_card` list, or an older file's
+        single value for every card."""
+        n = len(self.handles)
+        values = by_card.get(key)
+        if isinstance(values, list) and values:
+            values = [float(v) for v in values]
+            return (values + [values[-1]] * n)[:n]
+        return None if single is None else [float(single)] * n
+
     def _apply_runtime_state(self, state: dict):
         age = time.time() - float(state.get("saved_at", 0))
         adaptive = state.get("adaptive") or {}
         if adaptive.get("target_c") is not None and adaptive.get("trim_pct") is not None:
-            trim = (int(adaptive["target_c"]), float(adaptive["trim_pct"]))
-            if self.profile.name == "adaptive" and self.target == trim[0]:
-                floor = adaptive.get("trim_floor_pct")
-                if floor is not None:
-                    self._trim_floor_pct = max(TARGET_TRIM_MIN_PCT, min(0.0, float(floor)))
-                    self._floor_changed_at = time.monotonic()
-                self._target_trim_pct = max(self._trim_floor_pct, min(0.0, trim[1]))
+            by_card = adaptive.get("by_card") or {}
+            target_c = int(adaptive["target_c"])
+            trims = self._per_card(by_card, "trim_pct", adaptive["trim_pct"])
+            if self.profile.name == "adaptive" and self.target == target_c:
+                floors = self._per_card(by_card, "trim_floor_pct", adaptive.get("trim_floor_pct"))
+                for gpu in range(len(self.handles)):
+                    if floors is not None:
+                        self._trim_floor_pct[gpu] = max(TARGET_TRIM_MIN_PCT,
+                                                        min(0.0, floors[gpu]))
+                        self._floor_changed_at[gpu] = time.monotonic()
+                    self._target_trim_pct[gpu] = max(self._floor(gpu), min(0.0, trims[gpu]))
                 log.info(f"FAN: adaptive trim restored from runtime state "
-                         f"({self._target_trim_pct:+.1f}% for {trim[0]}C)")
+                         f"({self._trims_text()} for {target_c}C)")
             else:
-                self._pending_trim = trim
+                self._pending_trim = (target_c, trims)
         if age <= HOLD_RESTORE_MAX_AGE_S:
+            thermal = state.get("thermal") or {}
+            cards = thermal.get("cards")
             self.governor.restore_holds(
-                thermal=bool((state.get("thermal") or {}).get("limited")),
-                emergency=bool((state.get("emergency") or {}).get("active")))
+                thermal=bool(thermal.get("limited")),
+                emergency=bool((state.get("emergency") or {}).get("active")),
+                cards=[int(c) for c in cards] if isinstance(cards, list) else None)
         elif (state.get("thermal") or {}).get("limited") or (state.get("emergency") or {}).get("active"):
             log.info(f"runtime state holds are {age:.0f}s old (> {HOLD_RESTORE_MAX_AGE_S:.0f}s) "
                      "— not restored")
@@ -2396,15 +2467,26 @@ class FanController:
         if self.dry_run or (not force and now - self._last_runtime_save < RUNTIME_SAVE_INTERVAL_S):
             return
         self._last_runtime_save = now
-        adaptive = ({"target_c": self.target, "trim_pct": round(self._target_trim_pct, 2),
-                     "trim_floor_pct": round(self._trim_floor_pct, 1)}
-                    if self.profile.name == "adaptive" and self.target is not None
-                    else ({"target_c": self._pending_trim[0], "trim_pct": self._pending_trim[1]}
-                          if self._pending_trim else None))
+        n = len(self.handles)
+        # per card under "by_card"; the single "trim_pct"/"trim_floor_pct" are the least quiet
+        # card's, for a version from before per-card adaptive (a rollback)
+        if self.profile.name == "adaptive" and self.target is not None and n:
+            trims = [round(self._trim(g), 2) for g in range(n)]
+            floors = [round(self._floor(g), 1) for g in range(n)]
+            adaptive = {"target_c": self.target, "trim_pct": max(trims),
+                        "trim_floor_pct": max(floors),
+                        "by_card": {"trim_pct": trims, "trim_floor_pct": floors}}
+        elif self._pending_trim:
+            trims = [round(t, 2) for t in self._pending_trim[1]]
+            adaptive = {"target_c": self._pending_trim[0], "trim_pct": max(trims, default=0.0),
+                        "by_card": {"trim_pct": trims}}
+        else:
+            adaptive = None
         state = {
             "saved_at": time.time(),
             "adaptive": adaptive,
-            "thermal": {"limited": self.governor.thermal_limited},
+            "thermal": {"limited": self.governor.thermal_limited,
+                        "cards": sorted(self.governor.heat_cards)},
             "emergency": {"active": self.governor.emergency_active},
             "power": {"total_w": self.governor.total_w},
         }
@@ -2440,9 +2522,10 @@ class FanController:
                                if self.governor.alloc_w is not None else None),
             "temps_c": [self.last_temps.get(g) for g in range(len(self.handles))],
             "fan_pct": self.last_fan_pct,
-            "adaptive_trim_floor_pct": (round(self._trim_floor_pct, 1)
+            "fan_pct_by_card": [self._speed.get(g) for g in range(len(self.handles))],
+            "adaptive_trim_floor_pct": ([round(self._floor(g), 1) for g in range(len(self.handles))]
                                         if self.profile.name == "adaptive" else None),
-            "adaptive_trim_pct": (round(self._target_trim_pct, 1)
+            "adaptive_trim_pct": ([round(self._trim(g), 1) for g in range(len(self.handles))]
                                   if self.profile.name == "adaptive" else None),
             "messages": self.messages,
         }

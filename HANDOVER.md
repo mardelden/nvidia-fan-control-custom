@@ -134,9 +134,14 @@ python3 /opt/nvidia-fan-control/nvidia-fan-control.py --clear-override
   nothing at all.
 - **The thermal cut hits only the hot card(s)**; the 92 °C emergency is still host-wide. With a
   total, the cooler busy cards take the share a cut card can't use.
-- **`adaptive` unlearns from power cuts.** Each thermal hold raises a floor under its quiet trim
-  (+20%, up to 0 = the base curve); 10 cut-free minutes lower it 5%. The log shows
-  `FAN: adaptive unlearns …`; `effective.json` has `adaptive_trim_floor_pct`.
+- **`adaptive` is per card** (2026-10-10, decisions/017). Each card has its own fans, quiet trim
+  and floor; with mirror on, every card runs the fastest card's speed. `effective.json`'s
+  `adaptive_trim_pct` and `adaptive_trim_floor_pct` are now **lists, one per card** (they were
+  single numbers), and `fan_pct_by_card` is new. `fan_pct` is still one number: the hottest
+  card's speed under adaptive.
+- **`adaptive` unlearns from power cuts.** Each thermal hold raises a floor under the quiet trim
+  of the card it cut (+20%, up to 0 = the base curve); 10 cut-free minutes lower it 5%. The log
+  shows `FAN: adaptive unlearns … on GPU N`.
 - **`adaptive` needs a target.** Setting it without one is refused. Clearing the target while
   it's active falls back to `native`.
 - **The maximum target is emergency − 3 (89 °C).** Our old docs said 90–91; the cut point is
