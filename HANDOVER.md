@@ -28,6 +28,7 @@ other.
 | `fan-profile` | `native` `quiet` `aggressive` `performance` `max` `adaptive[:FANMAX]` | `native` |
 | `fan-mirror` | `on` `off` | `off` |
 | `temp-target` | °C, or `none` | no target |
+| `fan-target` | °C, or `none` (adaptive only: where the fans aim; below `temp-target` = cool-first) | the temperature target (quiet-first) |
 | `power-ceiling` | `W`, `W,W`, or `none` | the hardware max |
 | `power-ceiling-total` | `W` (all GPUs together), or `none` | the **last total** if one was in force (only `none` clears it); otherwise no total |
 
@@ -134,6 +135,12 @@ python3 /opt/nvidia-fan-control/nvidia-fan-control.py --clear-override
   nothing at all.
 - **The thermal cut hits only the hot card(s)**; the 92 °C emergency is still host-wide. With a
   total, the cooler busy cards take the share a cut card can't use.
+- **`fan-target` makes adaptive cool-first** (2026-11-07, decisions/018). The fans aim at it
+  using up to the fan max, and power is still cut at `temp-target`. It's clamped to the target,
+  so a night schedule that lowers the target pulls the aim down with it. `none` is today's
+  quiet-first behaviour. It appears in `effective.json` as `in_force.fan_target` and
+  `adaptive_fan_aim_c`. A new verb is needed, like the others:
+  `just gpu-fan-target-set <host> <C|none>`.
 - **`adaptive` is per card** (2026-10-10, decisions/017). Each card has its own fans, quiet trim
   and floor; with mirror on, every card runs the fastest card's speed. `effective.json`'s
   `adaptive_trim_pct` and `adaptive_trim_floor_pct` are now **lists, one per card** (they were

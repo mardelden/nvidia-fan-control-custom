@@ -16,7 +16,7 @@ since rewritten. The design history is in `plans/` and `plans/decisions/`.
 
 ## The settings
 
-There are five **live** settings. Each one is picked up without a restart and survives
+There are six **live** settings. Each one is picked up without a restart and survives
 reboots:
 
 | Setting | Values | No file means |
@@ -24,6 +24,7 @@ reboots:
 | **Fan profile** (whole host) | `native` · `quiet` · `aggressive` · `performance` · `max` · `adaptive[:FANMAX]` | `native` |
 | **Mirror** | `on` · `off` | `off` |
 | **Temperature target** | °C (50 … emergency − 3), or `none` | no target |
+| **Fan target** (`adaptive` only) | °C (50 … emergency − 3), or `none` | the temperature target (quiet-first) |
 | **Power ceiling** (per GPU) | `W` · `W,W` · `none` | the hardware max |
 | **Total ceiling** (all GPUs together) | `W` · `none` | no total |
 
@@ -73,6 +74,16 @@ with that card's fans on the base curve, ahead of the burst. Every 10 minutes wi
 lowers the floor by 5%, so a steady workload drifts back to quiet. The floors survive a
 restart. `effective.json` lists them per card as `adaptive_trim_floor_pct`, beside the trims
 (`adaptive_trim_pct`) and the fan speeds (`fan_pct_by_card`).
+
+**Quiet-first or cool-first.** By default adaptive is **quiet-first**: the fans aim at the
+temperature target and learn the least fan that holds the card there, and power is cut only
+once they're at the fan max. A **fan target** below the temperature target makes it
+**cool-first**: the fans aim at the fan target instead, so above it they run at the fan max,
+pushing the card as cool as they can. Below it they still learn to be quiet. Power is still
+cut at the temperature target, by the same rules. For example `temp-target 85`, `fan-target
+70`, `adaptive:90`: at 80 °C the fans are at 90%, and power is cut at 85 °C. A fan target at or
+above the temperature target means the fans aim at the target, so `none` and `85` behave the
+same here. `effective.json` shows where the fans aim as `adaptive_fan_aim_c`.
 
 **Mirror** is for cards that share airflow (back to back), to guarantee the exhaust: both
 fans follow the **hotter** card. With `native`, the hotter card stays on its factory curve and
@@ -218,7 +229,7 @@ Each setting is resolved in this order:
 1. **A flag on the command line.** Only for hand-runs.
 2. **A temporary override** in `/run/nvidia-fan-control/`. Cleared by a restart.
 3. **The saved file** in `/var/lib/nvidia-fan-control/`: `fan-profile`, `fan-mirror`,
-   `temp-target`, `power-ceiling`, `power-ceiling-total`.
+   `temp-target`, `fan-target`, `power-ceiling`, `power-ceiling-total`.
 4. **The default.**
 
 Changes to files are picked up within one fan tick (~2 s), and `systemctl reload`

@@ -1261,6 +1261,98 @@ try:
 except Exception as e:
     check("0 GPUs: a pending trim saves without error", False, e)
 
+print("\n== cool-first: a fan target below the power target (operator, 2026-11-07) ==")
+# The owner: below the target the fans push the temperature as low as they can, up to the fan
+# cap, instead of settling at the target; power is still cut at the target. Without a fan
+# target (quiet-first, unchanged) the fans settle the card near the target with the least fan.
+check("fan target parsed (C, none)",
+      nfc.parse_fan_target("70") == 70 and nfc.parse_fan_target("none") is None)
+for bad in ("45", "hot"):
+    try:
+        nfc.parse_fan_target(bad)
+        check(f"fan target {bad!r} refused", False)
+    except ValueError:
+        check(f"fan target {bad!r} refused", True)
+check("--fan-target reaches the CLI layer",
+      nfc.cli_settings(nfc.build_parser().parse_args(["--fan-target", "70"])) == {"fan_target": 70}
+      and nfc.cli_settings(nfc.build_parser().parse_args(["--fan-target", "none"]))
+      == {"fan_target": None})
+
+quiet, *_ = rig(saved={"profile": "adaptive:90", "target": "85"})
+set_temp(80, 45)
+tick(quiet, 60)
+quiet_fans = fans()
+ctl, gov, store, state, _ = rig(saved={"profile": "adaptive:90", "target": "85",
+                                       "fan_target": "70"})
+set_temp(80, 45)
+tick(ctl, 60)
+check("80C under an 85C target: quiet-first runs the fans below the cap",
+      quiet_fans[0] < 90, quiet_fans)
+check("cool-first (fan target 70): 10C over the fan target, the fans run at the cap (90%)",
+      fans()[0] == 90, fans())
+check("...the idle card follows its own temperature (30%)", fans()[1] == 30, fans())
+check("...and power isn't cut below the power target", limits() == [600.0, 600.0]
+      and not gov.thermal_limited, limits())
+ctl._write_effective()
+doc = json.load(open(os.path.join(ctl.run_dir, "effective.json")))
+check("effective.json shows the fan target in force and where the fans aim",
+      doc["in_force"]["fan_target"] == "70" and doc["adaptive_fan_aim_c"] == 70
+      and doc["settings"]["fan_target"] == {"value": "70", "source": "saved"},
+      (doc["in_force"], doc.get("adaptive_fan_aim_c"), doc["settings"].get("fan_target")))
+
+set_temp(66, 45)
+tick(ctl, 120)
+check("below the fan target the fans learn quiet again (still adaptive)",
+      ctl._trim(0) < 0 and fans()[0] < 90, (ctl._target_trim_pct, fans()))
+set_temp(86, 45)
+tick(ctl, 4)
+check("power is cut at the power target, the fans already at the cap",
+      gov.thermal_limited and limits()[0] < 600.0 and fans()[0] == 90, (limits(), fans()))
+
+# the trim is saved for the temperature it was learned at, the fans' aim
+ctl, gov, store, state, rdir = rig(saved={"profile": "adaptive:90", "target": "85",
+                                          "fan_target": "70"})
+set_temp(66, 45)
+tick(ctl, 60)
+learned = ctl._trim(0)
+ctl.save_runtime_state(force=True)
+doc = json.load(open(os.path.join(state, nfc.RUNTIME_STATE_FILE)))
+check("the trim is saved with the fans' aim (70), not the power target",
+      doc["adaptive"]["target_c"] == 70 and learned < 0, doc["adaptive"])
+ctl2 = nfc.FanController(nfc.SettingsStore(state, rdir, {}),
+                         nfc.PowerGovernor(handles=[], interval=5.0), emergency_c=92,
+                         state_dir=state, run_dir=rdir)
+ctl2.init()
+check("...restored after a restart with the same aim",
+      abs(ctl2._trim(0) - round(learned, 2)) < 0.01, ctl2._target_trim_pct)
+write(state, "fan_target", "none")
+ctl3 = nfc.FanController(nfc.SettingsStore(state, rdir, {}),
+                         nfc.PowerGovernor(handles=[], interval=5.0), emergency_c=92,
+                         state_dir=state, run_dir=rdir)
+ctl3.init()
+check("...but not when the aim changed (fan target cleared: the fans aim at 85)",
+      ctl3._trim(0) == 0.0 and ctl3._fan_aim() == 85, (ctl3._target_trim_pct, ctl3._fan_aim()))
+
+# live changes, the bounds
+ctl, gov, store, state, _ = rig(saved={"profile": "adaptive:90", "target": "85",
+                                       "fan_target": "70"})
+write(state, "fan_target", "none")
+tick(ctl, 1)
+check("fan target cleared live: back to quiet-first (aim = the power target)",
+      ctl.fan_target is None and ctl._fan_aim() == 85, (ctl.fan_target, ctl._fan_aim()))
+write(state, "fan_target", "90")
+tick(ctl, 1)
+check("a fan target above emergency - 3 (89C) is refused", ctl.fan_target is None,
+      ctl.fan_target)
+write(state, "fan_target", "88")
+tick(ctl, 1)
+check("a fan target above the power target is clamped: the fans aim at the target",
+      ctl.fan_target == 88 and ctl._fan_aim() == 85, (ctl.fan_target, ctl._fan_aim()))
+write(state, "target", "75")
+tick(ctl, 1)
+check("...and follow the target down (the schedule's 75C night target)",
+      ctl._fan_aim() == 75, ctl._fan_aim())
+
 print("\n== recovery per card: a cool card comes back fast while the other sits near the target ==")
 ctl, gov, *_ = rig(saved={"profile": "quiet", "ceiling": "600", "target": "60"}, budget=900)
 gov.ups.read = lambda: (500.0, ("OL",))
