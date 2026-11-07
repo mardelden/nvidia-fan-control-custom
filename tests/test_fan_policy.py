@@ -1353,6 +1353,21 @@ tick(ctl, 1)
 check("...and follow the target down (the schedule's 75C night target)",
       ctl._fan_aim() == 75, ctl._fan_aim())
 
+print("\n== the idle reset steps aside while the UPS is unreadable (deploy team fef8b7fc) ==")
+# pve-ai 2026-10-15, the EcoFlow off USB: the idle reset raised the idle card to its ceiling
+# every fan tick and the UPS-unreadable fallback clamped it back each UPS read, about every
+# 6 s (proxmox lesson 075). The fallback owns the caps while the UPS is unreadable.
+ctl, gov, *_ = rig(saved={"ceiling": "500", "total": "1000"}, budget=1500)
+gov.fallback_w = 150.0
+busy_cards(True, False)
+set_temp(60, 40)
+gov.ups.read = lambda: None
+gov.ups.consecutive_failures = 5
+trace = []
+run(ctl, 60, total=1e9, trace=trace)          # 2 minutes, past the 60 s idle dwell
+check("UPS unreadable: the idle card never rises above the 150 W fallback",
+      max(t[1] for t in trace) <= 150.0, sorted(set(t[1] for t in trace)))
+
 print("\n== recovery per card: a cool card comes back fast while the other sits near the target ==")
 ctl, gov, *_ = rig(saved={"profile": "quiet", "ceiling": "600", "target": "60"}, budget=900)
 gov.ups.read = lambda: (500.0, ("OL",))

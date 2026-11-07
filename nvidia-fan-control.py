@@ -860,9 +860,15 @@ class PowerGovernor:
         """With a total: a card idle for POWER_IDLE_DWELL_S and cooled below the release
         point gets its cap back to its ceiling. The cuts it collected while busy belong to a
         workload that's gone, and the total bounds it when it wakes. (Without a total the
-        UPS budget's behaviour is unchanged: only the all-idle reset.)"""
+        UPS budget's behaviour is unchanged: only the all-idle reset.) Not while the UPS is
+        unreadable either: the fallback clamp owns the caps then. Without this guard the two
+        fought on pve-ai (2026-10-15, EcoFlow USB lost): this reset raised idle cards to
+        500 W every fan tick and the next failed read clamped them back to 150 W, about every
+        6 s, so a card waking right after a reset ran above the fallback until the next read."""
         if (self.total_w is None or not self.cap_w or self.emergency_active
-                or self.blind_active or self._was_power_floor):
+                or self.blind_active or self._was_power_floor
+                or (self.budget_w is not None
+                    and self.ups.consecutive_failures >= POWER_MAX_READ_FAILURES)):
             return
         release_c = (self._target_c - THERMAL_POWER_RECOVER_MARGIN_C
                      if self._target_c is not None else None)
