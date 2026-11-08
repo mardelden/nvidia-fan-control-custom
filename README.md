@@ -24,7 +24,7 @@ reboots:
 | **Fan profile** (whole host) | `native` · `quiet` · `aggressive` · `performance` · `max` · `adaptive[:FANMAX]` | `native` |
 | **Mirror** | `on` · `off` | `off` |
 | **Temperature target** | °C (50 … emergency − 3), or `none` | no target |
-| **Fan target** (`adaptive` only) | °C (50 … emergency − 3), or `none` | the temperature target (quiet-first) |
+| **Fan aim** (`adaptive` only) | `quiet` · `balanced` · `cool` · °C (50 … emergency − 3) | `quiet` (the temperature target) |
 | **Power ceiling** (per GPU) | `W` · `W,W` · `none` | the hardware max |
 | **Total ceiling** (all GPUs together) | `W` · `none` | no total |
 
@@ -75,15 +75,24 @@ lowers the floor by 5%, so a steady workload drifts back to quiet. The floors su
 restart. `effective.json` lists them per card as `adaptive_trim_floor_pct`, beside the trims
 (`adaptive_trim_pct`) and the fan speeds (`fan_pct_by_card`).
 
-**Quiet-first or cool-first.** By default adaptive is **quiet-first**: the fans aim at the
-temperature target and learn the least fan that holds the card there, and power is cut only
-once they're at the fan max. A **fan target** below the temperature target makes it
-**cool-first**: the fans aim at the fan target instead, so above it they run at the fan max,
-pushing the card as cool as they can. Below it they still learn to be quiet. Power is still
-cut at the temperature target, by the same rules. For example `temp-target 85`, `fan-target
-70`, `adaptive:90`: at 80 °C the fans are at 90%, and power is cut at 85 °C. A fan target at or
-above the temperature target means the fans aim at the target, so `none` and `85` behave the
-same here. `effective.json` shows where the fans aim as `adaptive_fan_aim_c`.
+**Where the fans aim: quiet-first or cool-first.** Adaptive's fans aim at a temperature and
+learn the least fan that holds the card there; above it they run at the fan max. Power is
+always cut at the temperature target, by the same rules. The **fan aim** sets where the fans
+aim:
+
+| Fan aim | The fans aim at | Target 85 °C | Target 75 °C | |
+|---|---|---|---|---|
+| `quiet` (the default) | the temperature target | 85 °C | 75 °C | the least fan; the card runs close to the cut |
+| `balanced` | target − 8 °C | 77 °C | 67 °C | in between |
+| `cool` | target − 15 °C | 70 °C | 60 °C | the most cooling: the fans at the max under real load |
+| °C, e.g. `70` | that temperature | 70 °C | 70 °C | full control |
+
+The presets move with the temperature target, so one name serves a day and a night target.
+The aim is never above the target (a higher one is clamped) and never below 50 °C. For example
+`temp-target 85`, `fan-aim cool`, `adaptive:90`: at 80 °C the fans are at 90%, and power is cut
+at 85 °C. `none` means `quiet`. `effective.json` shows the aim as set (`in_force.fan_aim`) and
+in degrees (`adaptive_fan_aim_c`). The setting was called `fan-target` for a day; that file is
+still read while `fan-aim` is missing.
 
 **Mirror** is for cards that share airflow (back to back), to guarantee the exhaust: both
 fans follow the **hotter** card. With `native`, the hotter card stays on its factory curve and
@@ -229,7 +238,7 @@ Each setting is resolved in this order:
 1. **A flag on the command line.** Only for hand-runs.
 2. **A temporary override** in `/run/nvidia-fan-control/`. Cleared by a restart.
 3. **The saved file** in `/var/lib/nvidia-fan-control/`: `fan-profile`, `fan-mirror`,
-   `temp-target`, `fan-target`, `power-ceiling`, `power-ceiling-total`.
+   `temp-target`, `fan-aim`, `power-ceiling`, `power-ceiling-total`.
 4. **The default.**
 
 Changes to files are picked up within one fan tick (~2 s), and `systemctl reload`

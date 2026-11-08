@@ -14,7 +14,7 @@ Settings (all live: picked up without a restart, and surviving reboots):
     fan profile        native | quiet | aggressive | performance | max | adaptive[:FANMAX]
     mirror             on | off         (both fans follow the hotter card; back-to-back cards)
     temperature target degrees C | none
-    fan target         degrees C | none (adaptive: where the fans aim; none = the target)
+    fan aim            quiet | balanced | cool | degrees C (adaptive: where the fans aim)
     power ceiling      W | W,W | none   (per GPU)
     total ceiling      W | none         (all GPUs together, moved to the busy cards)
 
@@ -299,11 +299,13 @@ SETTING_FILES = {
     "target": "temp-target",
     "ceiling": "power-ceiling",
     "total": "power-ceiling-total",
-    "fan_target": "fan-target",
+    "fan_aim": "fan-aim",
 }
-SETTING_NAMES = ("profile", "mirror", "target", "ceiling", "total", "fan_target")
+# A setting's previous file name, read while the new file is missing (renamed 2026-11-07).
+SETTING_OLD_FILES = {"fan_aim": "fan-target"}
+SETTING_NAMES = ("profile", "mirror", "target", "ceiling", "total", "fan_aim")
 LOG_PREFIX = {"profile": "FAN", "mirror": "FAN", "target": "TEMP", "ceiling": "POWER",
-              "total": "POWER", "fan_target": "FAN"}
+              "total": "POWER", "fan_aim": "FAN"}
 RUNTIME_STATE_FILE = "runtime-state.json"
 EFFECTIVE_FILE = "effective.json"
 LOCK_FILE = "daemon.lock"
@@ -384,18 +386,27 @@ def parse_temp_target(value: str) -> Optional[int]:
     return celsius
 
 
-def parse_fan_target(value: str) -> Optional[int]:
-    """Where adaptive's fans aim, in degrees C; `none` / `off` / empty = the temperature
-    target itself. The upper bound is checked by the controller, as for the target."""
+# Fan aim presets (operator, 2026-11-07): degrees below the temperature target, so one name
+# works for the day and the night targets. quiet = today's quiet-first adaptive.
+FAN_AIM_PRESETS = {"quiet": 0, "balanced": 8, "cool": 15}
+DEFAULT_FAN_AIM = "quiet"
+
+
+def parse_fan_aim(value: str):
+    """`quiet` | `balanced` | `cool` (presets, below the temperature target) or degrees C.
+    `none` / `off` / empty = quiet. Returns the preset name or the degrees. The upper bound
+    of degrees is checked by the controller, as for the target."""
     text = _strip(value)
     if text in ("", "none", "off"):
-        return None
+        return DEFAULT_FAN_AIM
+    if text in FAN_AIM_PRESETS:
+        return text
     try:
         celsius = int(text.rstrip("c"))
     except ValueError:
-        raise ValueError(f"expected degrees C or none, got {text!r}")
+        raise ValueError(f"expected {', '.join(FAN_AIM_PRESETS)} or degrees C, got {text!r}")
     if celsius < TEMP_TARGET_MIN_C:
-        raise ValueError(f"fan target must be at least {TEMP_TARGET_MIN_C}C, got {celsius}C")
+        raise ValueError(f"fan aim must be at least {TEMP_TARGET_MIN_C}C, got {celsius}C")
     return celsius
 
 
@@ -455,8 +466,8 @@ def _parse_setting(name: str, text: str):
         return parse_mirror(text)
     if name == "target":
         return parse_temp_target(text)
-    if name == "fan_target":
-        return parse_fan_target(text)
+    if name == "fan_aim":
+        return parse_fan_aim(text)
     if name == "total":
         return parse_power_total(text) or None
     request = parse_power_ceiling(text)
@@ -468,15 +479,17 @@ def format_setting(name: str, value) -> str:
         return value.text()
     if name == "mirror":
         return "on" if value else "off"
-    if name in ("target", "fan_target"):
+    if name == "target":
         return "none" if value is None else str(value)
+    if name == "fan_aim":
+        return str(value)
     if name == "total":
         return "none" if not value else f"{value:g}"
     return "none" if not value else ",".join(f"{w:g}" for w in value)
 
 
 SETTING_DEFAULTS = {"profile": FanProfile(DEFAULT_PROFILE), "mirror": False,
-                    "target": None, "ceiling": None, "total": None, "fan_target": None}
+                    "target": None, "ceiling": None, "total": None, "fan_aim": DEFAULT_FAN_AIM}
 
 
 def _argtype(parser_fn):
@@ -516,7 +529,13 @@ class SettingsStore:
         self.generation = 0
 
     def path(self, layer: str, name: str) -> str:
-        return os.path.join(self.dirs[layer], SETTING_FILES[name])
+        path = os.path.join(self.dirs[layer], SETTING_FILES[name])
+        old = SETTING_OLD_FILES.get(name)
+        if old and not os.path.exists(path):
+            legacy = os.path.join(self.dirs[layer], old)
+            if os.path.exists(legacy):
+                return legacy
+        return path
 
     def request_reload(self):
         self._reload = True
@@ -537,6 +556,9 @@ class SettingsStore:
             return False
         self.stamps[layer][name] = stamp
         had = name in self.layers[layer]
+        if stamp is not None and os.path.basename(path) == SETTING_OLD_FILES.get(name):
+            log.warning(f"⚠ {LOG_PREFIX[name]}: reading {path}, the old name of "
+                        f"{SETTING_FILES[name]}; write {SETTING_FILES[name]} instead")
         if stamp is None:
             self.layers[layer].pop(name, None)
             return had
@@ -1960,7 +1982,7 @@ class FanController:
         self.profile = FanProfile(DEFAULT_PROFILE)
         self.mirror = False
         self.target: Optional[int] = None
-        self.fan_target: Optional[int] = None   # adaptive's fan aim; None = the target
+        self.fan_aim = DEFAULT_FAN_AIM          # adaptive: a preset name or degrees C
         self.requested_profile = FanProfile(DEFAULT_PROFILE)
         # fan state
         self._manual: Dict[int, Optional[bool]] = {}     # gpu -> policy we last set
@@ -2023,7 +2045,7 @@ class FanController:
             live, _ = self.store.resolve(name)
             what = {"profile": "FAN: profile", "mirror": "FAN: mirror",
                     "target": "TEMP: target", "ceiling": "POWER: ceiling",
-                    "total": "POWER: total ceiling", "fan_target": "FAN: fan target"}[name]
+                    "total": "POWER: total ceiling", "fan_aim": "FAN: fan aim"}[name]
             if source == "override":
                 hidden = (f"masked until restart by a temporary override "
                           f"({format_setting(name, live)})")
@@ -2051,9 +2073,9 @@ class FanController:
         if "target" in by_name:
             value, source = by_name["target"]
             self._set_target(value, describe_source(self.store, "target", source))
-        if "fan_target" in by_name:
-            value, source = by_name["fan_target"]
-            self._set_fan_target(value, describe_source(self.store, "fan_target", source))
+        if "fan_aim" in by_name:
+            value, source = by_name["fan_aim"]
+            self._set_fan_aim(value, describe_source(self.store, "fan_aim", source))
         if "mirror" in by_name:
             value, source = by_name["mirror"]
             if value != self.mirror or startup:
@@ -2087,36 +2109,48 @@ class FanController:
                        f"{THERMAL_POWER_INITIAL_DWELL_S:.0f}s grace (none at "
                        f"{value + THERMAL_POWER_SKIP_DWELL_EXCESS_C}C+)")
 
-    def _set_fan_target(self, value: Optional[int], source: str):
-        """Cool-first adaptive (operator, 2026-11-07): the fans aim at the fan target, using up
-        to the fan max, while power is still cut at the temperature target. None = quiet-first:
-        the fans aim at the target itself."""
+    def _set_fan_aim(self, value, source: str):
+        """Where adaptive's fans aim (operator, 2026-11-07). A preset (quiet / balanced / cool)
+        sits that many degrees below the temperature target; degrees are taken as given. Power
+        is still cut at the temperature target. quiet = the target itself (quiet-first)."""
         highest = self.emergency_c - TEMP_TARGET_EMERGENCY_GAP_C
-        if value is not None and value > highest:
-            self._note(f"FAN: ignoring fan target {value}C ({source}) — it must be at most "
-                       f"{highest}C; keeping "
-                       + (f"{self.fan_target}C" if self.fan_target is not None else "none"), True)
+        if isinstance(value, int) and value > highest:
+            self._note(f"FAN: ignoring fan aim {value}C ({source}) — it must be at most "
+                       f"{highest}C; keeping {self._fan_aim_text()}", True)
             return
-        if value == self.fan_target:
+        if value == self.fan_aim:
             return
-        self.fan_target = value
-        if value is None:
-            self._note(f"FAN: fan target cleared ({source}); adaptive's fans aim at the "
+        self.fan_aim = value
+        if value == DEFAULT_FAN_AIM:
+            self._note(f"FAN: fan aim set to quiet ({source}); adaptive's fans aim at the "
                        f"temperature target (quiet-first)")
             return
-        above = self.target is not None and value >= self.target
-        self._note(f"FAN: fan target set to {value}C ({source}); adaptive's fans aim at "
-                   f"{value}C using up to the fan max (cool-first), and power is still cut at "
-                   f"the temperature target"
+        aim_c = self._fan_aim_c()
+        self._note(f"FAN: fan aim set to {self._fan_aim_text()} ({source}); adaptive's fans aim "
+                   + (f"at {aim_c}C" if aim_c is not None else "below the temperature target")
+                   + " using up to the fan max, and power is still cut at the temperature target"
                    + (f" ({self.target}C)" if self.target is not None else "")
-                   + (" — at or above it, so the fans aim at the target" if above else ""))
+                   + (" — at or above it, so the fans aim at the target"
+                      if isinstance(value, int) and self.target is not None
+                      and value >= self.target else ""))
 
-    def _fan_aim(self) -> Optional[int]:
-        """Where adaptive's fans aim: the fan target, never above the temperature target;
-        without a fan target, the temperature target itself."""
+    def _fan_aim_text(self) -> str:
+        """The fan aim as set: `cool (target - 15C)`, `70C`, or `quiet`."""
+        if isinstance(self.fan_aim, int):
+            return f"{self.fan_aim}C"
+        drop = FAN_AIM_PRESETS[self.fan_aim]
+        return self.fan_aim + (f" (target - {drop}C)" if drop else "")
+
+    def _fan_aim_c(self) -> Optional[int]:
+        """Where adaptive's fans aim, in degrees C: a preset below the temperature target, or
+        the degrees given; never above the target, never below TEMP_TARGET_MIN_C."""
         if self.target is None:
             return None
-        return self.target if self.fan_target is None else min(self.fan_target, self.target)
+        if isinstance(self.fan_aim, int):
+            aim = self.fan_aim
+        else:
+            aim = max(TEMP_TARGET_MIN_C, self.target - FAN_AIM_PRESETS[self.fan_aim])
+        return min(aim, self.target)
 
     def _resolve_profile(self, source: str, startup: bool):
         want = self.requested_profile
@@ -2139,7 +2173,7 @@ class FanController:
         self._note(f"FAN: profile set to {profile.describe()} ({source})")
         if profile.name == "adaptive":
             self._commanded_fan_pct = {}       # re-seeded from the measured speeds
-            if self._pending_trim and self._pending_trim[0] == self._fan_aim():
+            if self._pending_trim and self._pending_trim[0] == self._fan_aim_c():
                 self._target_trim_pct = dict(enumerate(self._pending_trim[1]))
                 log.info(f"FAN: adaptive trim restored from runtime state "
                          f"({self._trims_text()})")
@@ -2344,7 +2378,7 @@ class FanController:
     def get_target_fan_demand(self, temp: int) -> int:
         """adaptive's feed-forward ramp: 30% at aim-20C, rising to 100% at the aim (the fan
         target, or the temperature target without one)."""
-        approach_start = self._fan_aim() - TARGET_FAN_APPROACH_BAND_C
+        approach_start = self._fan_aim_c() - TARGET_FAN_APPROACH_BAND_C
         if temp <= approach_start:
             return TARGET_FAN_MIN_PCT
         ratio = (temp - approach_start) / TARGET_FAN_APPROACH_BAND_C
@@ -2388,7 +2422,7 @@ class FanController:
         sharing the exhaust), every card runs the fastest card's speed.
         Returns the % commanded to each card."""
         fan_max = self.profile.fan_max
-        aim = self._fan_aim()
+        aim = self._fan_aim_c()
         commands: Dict[int, int] = {}
         parts = []
         for gpu in sorted(temps):
@@ -2502,7 +2536,7 @@ class FanController:
             by_card = adaptive.get("by_card") or {}
             target_c = int(adaptive["target_c"])
             trims = self._per_card(by_card, "trim_pct", adaptive["trim_pct"])
-            if self.profile.name == "adaptive" and self._fan_aim() == target_c:
+            if self.profile.name == "adaptive" and self._fan_aim_c() == target_c:
                 floors = self._per_card(by_card, "trim_floor_pct", adaptive.get("trim_floor_pct"))
                 for gpu in range(len(self.handles)):
                     if floors is not None:
@@ -2536,7 +2570,7 @@ class FanController:
         if self.profile.name == "adaptive" and self.target is not None and n:
             trims = [round(self._trim(g), 2) for g in range(n)]
             floors = [round(self._floor(g), 1) for g in range(n)]
-            adaptive = {"target_c": self._fan_aim(), "trim_pct": max(trims),
+            adaptive = {"target_c": self._fan_aim_c(), "trim_pct": max(trims),
                         "trim_floor_pct": max(floors),
                         "by_card": {"trim_pct": trims, "trim_floor_pct": floors}}
         elif self._pending_trim:
@@ -2574,7 +2608,7 @@ class FanController:
             "settings": settings,
             "in_force": {"profile": self.profile.text(), "mirror": "on" if self.mirror else "off",
                          "target": format_setting("target", self.target),
-                         "fan_target": format_setting("fan_target", self.fan_target),
+                         "fan_aim": format_setting("fan_aim", self.fan_aim),
                          "ceiling": format_setting("ceiling", self.governor.ceiling_request),
                          "total": format_setting("total", self.governor.total_w)},
             "emergency_c": self.emergency_c,
@@ -2591,7 +2625,7 @@ class FanController:
                                         if self.profile.name == "adaptive" else None),
             "adaptive_trim_pct": ([round(self._trim(g), 1) for g in range(len(self.handles))]
                                   if self.profile.name == "adaptive" else None),
-            "adaptive_fan_aim_c": self._fan_aim() if self.profile.name == "adaptive" else None,
+            "adaptive_fan_aim_c": self._fan_aim_c() if self.profile.name == "adaptive" else None,
             "messages": self.messages,
         }
         try:
@@ -2706,12 +2740,14 @@ def read_effective(run_dir: str) -> Optional[dict]:
 def clear_overrides(run_dir: str) -> List[str]:
     removed = []
     for name in SETTING_NAMES:
-        path = os.path.join(run_dir, SETTING_FILES[name])
-        try:
-            os.remove(path)
-            removed.append(SETTING_FILES[name])
-        except FileNotFoundError:
-            pass
+        for filename in (SETTING_FILES[name], SETTING_OLD_FILES.get(name)):
+            if filename is None:
+                continue
+            try:
+                os.remove(os.path.join(run_dir, filename))
+                removed.append(filename)
+            except FileNotFoundError:
+                pass
     return removed
 
 
@@ -2818,11 +2854,11 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Temperature target in C, or 'none'. Power is cut at the target (a 5s "
                            "grace while steady). Given without --mode, implies --mode adaptive "
                            "(the old behaviour)")
-    live.add_argument("--fan-target", type=_argtype(parse_fan_target), metavar="C",
-                      default=argparse.SUPPRESS,
-                      help="adaptive only: where the fans aim, in C, using up to the fan max "
-                           "(cool-first), while power is still cut at --temp-target; 'none' = "
-                           "aim at the target itself (quiet-first, the default)")
+    live.add_argument("--fan-aim", "--fan-target", dest="fan_aim",
+                      type=_argtype(parse_fan_aim), metavar="AIM", default=argparse.SUPPRESS,
+                      help="adaptive only: where the fans aim, using up to the fan max, while "
+                           "power is still cut at --temp-target: quiet (the target itself, the "
+                           "default), balanced (target - 8C), cool (target - 15C), or degrees C")
     live.add_argument("--power-ceiling", type=_argtype(parse_power_ceiling), metavar="WATTS",
                       help="Per-GPU power ceiling: W, W,W, or 'none'")
     live.add_argument("--power-ceiling-total", type=_argtype(parse_power_total), metavar="WATTS",
@@ -2876,8 +2912,8 @@ def cli_settings(args) -> Dict[str, object]:
         cli["target"] = args.temp_target
         if args.mode is None and args.temp_target is not None:
             cli["profile"] = FanProfile("adaptive")     # legacy: --temp-target meant adaptive
-    if hasattr(args, "fan_target"):
-        cli["fan_target"] = args.fan_target
+    if hasattr(args, "fan_aim"):
+        cli["fan_aim"] = args.fan_aim
     if args.power_ceiling is not None:
         cli["ceiling"] = args.power_ceiling or None
     if args.power_ceiling_total is not None:

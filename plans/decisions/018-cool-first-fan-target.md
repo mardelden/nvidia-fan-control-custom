@@ -72,3 +72,28 @@ the least fan. Power is cut once the fans are at the cap and the card still reac
   - live changes;
   - the refusal above emergency − 3;
   - the clamp to the target.
+
+## Addendum (2026-11-07, the owner): renamed `fan-aim`, with presets
+
+**The rename.** "Fan target" read like a second target beside `temp-target`. The owner: "fan
+aim … I think makes sense". The setting is now **`fan-aim`**:
+- file `fan-aim`, flag `--fan-aim`;
+- `settings.fan_aim` and `in_force.fan_aim` in `effective.json`.
+
+**The transition.** The day-old `fan-target` keeps working: the file is read while `fan-aim` is
+missing, with a warning, and `--fan-target` is an alias. `--clear-override` removes both names.
+
+**Presets** (the owner: "the most cooling, the quietest, and a standard in the middle") are
+degrees below the temperature target, so one name serves the day and the night targets:
+
+| Preset | Aim | At target 85 °C | At target 75 °C |
+|---|---|---|---|
+| `quiet` (the default; `none` too) | the target | 85 | 75 |
+| `balanced` | target − 8 °C | 77 | 67 |
+| `cool` | target − 15 °C | 70 | 60 |
+
+Degrees are still accepted, for full control. A preset never resolves below 50 °C. The offsets
+are a first guess, to be tuned under load. `in_force.fan_aim` shows the preset name, and
+`adaptive_fan_aim_c` the degrees.
+
+**Tests:** 304 + 23.
