@@ -309,6 +309,17 @@ LOG_PREFIX = {"profile": "FAN", "mirror": "FAN", "target": "TEMP", "ceiling": "P
 RUNTIME_STATE_FILE = "runtime-state.json"
 EFFECTIVE_FILE = "effective.json"
 LOCK_FILE = "daemon.lock"
+# Host request (heatguard, owner ruling heatguard/7, 2026-11-14): another tool on the host asks
+# for less GPU power, e.g. when the board zone stays hot with its fans at 100%. It is a JSON
+# file in the run dir, {"total_w": W, "reason": "...", "from": "heatguard"}: a cap on all GPUs
+# together, applied like the total ceiling. It counts only while it is fresh (rewritten within
+# HOST_REQUEST_MAX_AGE_S), so a dead requester can't hold power down. Lowering is immediate;
+# when it rises or lifts, the cap walks back up HOST_REQUEST_RAISE_STEP_W every
+# HOST_REQUEST_RAISE_DWELL_S, so the board heat it was asked for doesn't come straight back.
+HOST_REQUEST_FILE = "host-request"
+HOST_REQUEST_MAX_AGE_S = 120.0
+HOST_REQUEST_RAISE_STEP_W = 50.0
+HOST_REQUEST_RAISE_DWELL_S = 30.0
 RUNTIME_SAVE_INTERVAL_S = 60.0
 HOLD_RESTORE_MAX_AGE_S = 300.0
 OVERRIDE_ACK_TIMEOUT_S = 15.0
@@ -765,8 +776,13 @@ class PowerGovernor:
         self.recovery_walk = False
         self.ceiling_request: Optional[List[float]] = None
         self.ceiling_w: Optional[List[float]] = None
-        # total ceiling (plan 003)
+        # total ceiling (plan 003): total_w is the one in force, the lower of the operator's
+        # total and a host request's cap
         self.total_w: Optional[float] = None
+        self.operator_total_w: Optional[float] = None
+        self.host_request_w: Optional[float] = None     # what the host request asks for
+        self.host_bound_w: Optional[float] = None       # what of it is in force (walks up)
+        self._host_raised_at = 0.0
         self.alloc_w: Optional[List[float]] = None
         self._busy: List[bool] = []
         self._quiet_since: List[Optional[float]] = []
@@ -1203,8 +1219,44 @@ class PowerGovernor:
 
     # ── the total ceiling (plan 003) ──
     def apply_total(self, total: Optional[float], source: str):
-        """Make `total` (W, all GPUs together) the active total ceiling. None removes it."""
+        """Make `total` (W, all GPUs together) the operator's total ceiling. None removes it.
+        A host request may hold the total in force lower (see apply_host_request)."""
         n = len(self.handles)
+        if total is None:
+            if self.operator_total_w is None:
+                return
+            self.operator_total_w = None
+            log.info(f"POWER: total ceiling cleared ({source})"
+                     + (f"; a host request still holds the GPUs at {self.host_bound_w:g} W"
+                        if self.host_bound_w is not None
+                        else " — each GPU bounded by its own ceiling only"))
+            self._apply_effective_total()
+            return
+        floor = sum(self.min_w)
+        if total < floor - 0.5:
+            log.error(f"POWER: ignoring total ceiling {total:g} W from {source} — below the "
+                      f"{floor:.0f} W the GPUs need at their minimum; keeping "
+                      + (f"{self.operator_total_w:g} W" if self.operator_total_w is not None
+                         else "no total"))
+            return
+        if self.operator_total_w is not None and abs(total - self.operator_total_w) < 0.5:
+            return
+        self.operator_total_w = float(total)
+        top = sum(self._ceil_w(i) for i in range(n))
+        note = (f"; above the {top:.0f} W sum of the GPUs' ceilings, so it doesn't bind"
+                if total >= top - 0.5 else "")
+        held = (f"; a host request holds the GPUs at {self.host_bound_w:g} W for now"
+                if self.host_bound_w is not None and self.host_bound_w < total - 0.5 else "")
+        log.info(f"POWER: total ceiling set to {total:g} W across {n} GPU(s) ({source}); "
+                 f"soft: idle GPUs counted at their measured draw (10 s peak + "
+                 f"{ALLOC_IDLE_RESERVE_MARGIN_W:.0f} W, in {ALLOC_IDLE_RESERVE_STEP_W:.0f} W "
+                 f"steps), the busy ones share the rest{note}{held}")
+        self._apply_effective_total()
+
+    def _apply_effective_total(self):
+        """Put the lower of the operator's total and the host request's cap in force."""
+        caps = [w for w in (self.operator_total_w, self.host_bound_w) if w is not None]
+        total = min(caps) if caps else None
         if total is None:
             if self.total_w is None:
                 return
@@ -1212,31 +1264,70 @@ class PowerGovernor:
             self.alloc_w = None
             self._recompute_max_w()
             self._hold_log_pending = True
-            log.info(f"POWER: total ceiling cleared ({source}) — each GPU bounded by its own "
-                     "ceiling only")
             if self.budget_w is None:
                 self._hold_ceiling()
-            return
-        floor = sum(self.min_w)
-        if total < floor - 0.5:
-            log.error(f"POWER: ignoring total ceiling {total:g} W from {source} — below the "
-                      f"{floor:.0f} W the GPUs need at their minimum; keeping "
-                      + (f"{self.total_w:g} W" if self.total_w is not None else "no total"))
             return
         if self.total_w is not None and abs(total - self.total_w) < 0.5:
             return
         self.total_w = float(total)
         self._hold_log_pending = True
-        top = sum(self._ceil_w(i) for i in range(n))
-        note = (f"; above the {top:.0f} W sum of the GPUs' ceilings, so it doesn't bind"
-                if total >= top - 0.5 else "")
-        log.info(f"POWER: total ceiling set to {total:g} W across {n} GPU(s) ({source}); "
-                 f"soft: idle GPUs counted at their measured draw (10 s peak + "
-                 f"{ALLOC_IDLE_RESERVE_MARGIN_W:.0f} W, in {ALLOC_IDLE_RESERVE_STEP_W:.0f} W "
-                 f"steps), the busy ones share the rest{note}")
         self._allocate(time.monotonic(), refresh=True)
         if self.budget_w is None:
             self._hold_ceiling()
+
+    def apply_host_request(self, total: Optional[float], who: str = "", reason: str = ""):
+        """A host request's cap on all GPUs together (heatguard); None = no request (absent,
+        stale or malformed). Lower: at once. Higher or lifted: walks up (_walk_host_bound)."""
+        if total is not None:
+            floor = sum(self.min_w)
+            if total < floor - 0.5:
+                log.warning(f"⚠ POWER: host request from {who} asks for {total:g} W, below the "
+                            f"{floor:.0f} W the GPUs need at their minimum; holding {floor:.0f} W")
+                total = floor
+        same = ((total is None and self.host_request_w is None)
+                or (total is not None and self.host_request_w is not None
+                    and abs(total - self.host_request_w) < 0.5))
+        if same:
+            return
+        self.host_request_w = total
+        if total is not None and (self.host_bound_w is None or total < self.host_bound_w - 0.5):
+            self.host_bound_w = float(total)
+            self._host_raised_at = time.monotonic()
+            log.warning(f"⚠ POWER: host request from {who}: all GPUs together at most "
+                        f"{total:g} W" + (f" ({reason})" if reason else "")
+                        + f" -> GPU total {min(total, self.operator_total_w or total):g} W")
+            self._apply_effective_total()
+        elif self.host_bound_w is not None:
+            self._host_raised_at = time.monotonic()     # the first step up after one dwell
+            log.info(f"POWER: host request from {who} "
+                     + (f"raised to {total:g} W" if total is not None else "lifted")
+                     + f" -> the GPU total walks back up +{HOST_REQUEST_RAISE_STEP_W:.0f} W every "
+                     f"{HOST_REQUEST_RAISE_DWELL_S:.0f}s")
+
+    def _walk_host_bound(self, now: float):
+        """Walk the host request's cap up toward what it now asks for (or away, once lifted)."""
+        if self.host_bound_w is None:
+            return
+        want = self.host_request_w
+        if want is not None and self.host_bound_w >= want - 0.5:
+            return
+        if now - self._host_raised_at < HOST_REQUEST_RAISE_DWELL_S:
+            return
+        self._host_raised_at = now
+        step_to = self.host_bound_w + HOST_REQUEST_RAISE_STEP_W
+        if want is not None:
+            self.host_bound_w = min(step_to, want)
+        else:
+            top = (self.operator_total_w if self.operator_total_w is not None
+                   else sum(self._ceil_w(i) for i in range(len(self.handles))))
+            if step_to >= top - 0.5:
+                self.host_bound_w = None
+                log.info("POWER: host request lifted: the GPU total is back to "
+                         + (f"{self.operator_total_w:g} W" if self.operator_total_w is not None
+                            else "no total"))
+            else:
+                self.host_bound_w = step_to
+        self._apply_effective_total()
 
     def settle_after_start(self):
         """With a total and no hold to restore, start every card at its full share.
@@ -1691,6 +1782,7 @@ class PowerGovernor:
     # ── the UPS loop ──
     def update(self, force: bool = False):
         now = time.monotonic()
+        self._walk_host_bound(now)
         # the total is moved every fan tick from NVML (no lag), not on the UPS interval
         self._allocate(now)
         self._reset_idle_caps(now)
@@ -2003,6 +2095,12 @@ class FanController:
         self._written_snapshot: Optional[tuple] = None
         self._written_at = 0.0
         self._read_history: List[bool] = []     # True = a card was unreadable (blind window)
+        # host request (heatguard): the file's stamp, what it said, and its state now
+        self._host_stamp: Optional[Tuple[int, int]] = None
+        self._host_doc: Optional[dict] = None
+        self._host_error: Optional[str] = None
+        self.host_status = "none"           # none | applied | stale | malformed
+        self.host_age_s: Optional[float] = None
         self._blind_reported = False
         # set here, not in run(): a stop requested during init() must be honoured (#6)
         self.running = True
@@ -2062,7 +2160,8 @@ class FanController:
             if value is None and source == "default":
                 # the file is gone or unreadable: fail closed (deploy-team review #2, the
                 # operator's choice B). Only an explicit `none` clears the total.
-                keep = (self.governor.total_w if self.governor.total_w is not None
+                keep = (self.governor.operator_total_w
+                        if self.governor.operator_total_w is not None
                         else self._remembered_total())
                 if keep is not None:
                     self._note(f"⚠ POWER: no readable total ceiling file "
@@ -2272,11 +2371,72 @@ class FanController:
             self._settle[gpu] = False
         return eased
 
+    # ── host request (heatguard) ──
+    def _refresh_host_request(self):
+        """Read the run dir's host-request file when it changes, and drop it once it's stale:
+        a cap on all GPUs together that another host tool asks for (HOST_REQUEST_FILE)."""
+        path = os.path.join(self.run_dir, HOST_REQUEST_FILE)
+        try:
+            st = os.stat(path)
+        except FileNotFoundError:
+            st = None
+        except OSError as e:
+            log.warning(f"⚠ POWER: cannot stat {path}: {e}")
+            return
+        stamp = (st.st_mtime_ns, st.st_size) if st else None
+        if stamp != self._host_stamp:
+            self._host_stamp = stamp
+            self._host_doc, self._host_error = None, None
+            if st and st.st_size:
+                try:
+                    with open(path) as f:
+                        doc = json.load(f)
+                    if not isinstance(doc, dict):
+                        raise ValueError("not a JSON object")
+                    total = doc.get("total_w")
+                    if isinstance(total, bool) or not isinstance(total, (int, float)) or total <= 0:
+                        raise ValueError(f"total_w must be watts > 0, got {total!r}")
+                    self._host_doc = {"total_w": float(total),
+                                      "from": str(doc.get("from") or "an unnamed tool"),
+                                      "reason": str(doc.get("reason") or "")}
+                except (OSError, ValueError) as e:
+                    self._host_error = str(e)
+                    log.error(f"POWER: ignoring malformed host request {path}: {e}")
+        status, age = "none", None
+        if self._host_error is not None:
+            status = "malformed"
+        elif self._host_doc is not None:
+            age = max(0.0, time.time() - st.st_mtime)
+            status = "applied" if age <= HOST_REQUEST_MAX_AGE_S else "stale"
+            if status == "stale" and self.host_status != "stale":
+                log.warning(f"⚠ POWER: host request {path} from {self._host_doc['from']} is "
+                            f"{age:.0f}s old (> {HOST_REQUEST_MAX_AGE_S:.0f}s, not refreshed) "
+                            f"-> ignored")
+        self.host_status, self.host_age_s = status, age
+        doc = self._host_doc if status == "applied" else None
+        self.governor.apply_host_request(doc["total_w"] if doc else None,
+                                         (doc or self._host_doc or {}).get("from", ""),
+                                         (doc or {}).get("reason", ""))
+
+    def _host_request_doc(self) -> Optional[dict]:
+        """For effective.json: the host request and what of it is in force."""
+        g = self.governor
+        if self.host_status == "none" and g.host_bound_w is None:
+            return None
+        doc = dict(self._host_doc or {})
+        doc.update({"status": self.host_status if self.host_status != "none" else "lifted",
+                    "age_s": round(self.host_age_s) if self.host_age_s is not None else None,
+                    "in_force_w": round(g.host_bound_w) if g.host_bound_w is not None else None})
+        if self._host_error is not None:
+            doc["error"] = self._host_error
+        return doc
+
     # ── one tick ──
     def update(self):
         changes, masked = self.store.refresh()
         if changes or masked:
             self._apply(changes, masked)
+        self._refresh_host_request()
         if changes or masked or self.store.generation != self._written_generation:
             self._write_effective()
         temps = self._read_temps()
@@ -2585,7 +2745,7 @@ class FanController:
             "thermal": {"limited": self.governor.thermal_limited,
                         "cards": sorted(self.governor.heat_cards)},
             "emergency": {"active": self.governor.emergency_active},
-            "power": {"total_w": self.governor.total_w},
+            "power": {"total_w": self.governor.operator_total_w},
         }
         try:
             os.makedirs(self.state_dir, exist_ok=True)
@@ -2610,7 +2770,7 @@ class FanController:
                          "target": format_setting("target", self.target),
                          "fan_aim": format_setting("fan_aim", self.fan_aim),
                          "ceiling": format_setting("ceiling", self.governor.ceiling_request),
-                         "total": format_setting("total", self.governor.total_w)},
+                         "total": format_setting("total", self.governor.operator_total_w)},
             "emergency_c": self.emergency_c,
             "holds": {"thermal": self.governor.thermal_limited,
                       "emergency": self.governor.emergency_active,
@@ -2618,6 +2778,9 @@ class FanController:
             "power_limits_w": [round(w) for w in self.governor.applied_w],
             "total_shares_w": ([round(w) for w in self.governor.alloc_w]
                                if self.governor.alloc_w is not None else None),
+            "total_in_force_w": (round(self.governor.total_w)
+                                 if self.governor.total_w is not None else None),
+            "host_request": self._host_request_doc(),
             "temps_c": [self.last_temps.get(g) for g in range(len(self.handles))],
             "fan_pct": self.last_fan_pct,
             "fan_pct_by_card": [self._speed.get(g) for g in range(len(self.handles))],

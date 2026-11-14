@@ -1417,6 +1417,100 @@ run(ctl, 60, total=1e9, trace=trace)          # 2 minutes, past the 60 s idle dw
 check("UPS unreadable: the idle card never rises above the 150 W fallback",
       max(t[1] for t in trace) <= 150.0, sorted(set(t[1] for t in trace)))
 
+print("\n== host request: another host tool asks for less GPU power (heatguard, 2026-11-14) ==")
+# heatguard (owner ruling heatguard/7): when the board zone stays at its limit with the board
+# fans at 100%, it asks for less GPU power. It never sets a limit itself: it writes
+# /run/nvidia-fan-control/host-request and the governor applies it like a total.
+def host_request(rdir, doc, age=0.0):
+    path = os.path.join(rdir, nfc.HOST_REQUEST_FILE)
+    with open(path, "w") as f:
+        f.write(doc if isinstance(doc, str) else json.dumps(doc))
+    t = CLOCK.time() - age
+    os.utime(path, (t, t))
+
+def effective(ctl):
+    ctl._write_effective()
+    return json.load(open(os.path.join(ctl.run_dir, "effective.json")))
+
+ctl, gov, store, state, rdir = rig(saved={"ceiling": "600", "total": "1000"})
+busy_cards(True, True)
+set_temp(60, 60)
+run(ctl, 3, total=1e9)
+before = limits()
+host_request(rdir, {"total_w": 600, "reason": "board SYSTIN 51 C >= limit 50", "from": "heatguard"})
+run(ctl, 1, total=1e9)
+doc = effective(ctl)
+check("a fresh host request lowers the GPUs' total at once (500/500 -> 300/300)",
+      before == [500.0, 500.0] and limits() == [300.0, 300.0] and gov.total_w == 600.0,
+      (before, limits(), gov.total_w))
+check("...the operator's total is unchanged and still what in_force.total shows",
+      gov.operator_total_w == 1000.0 and doc["in_force"]["total"] == "1000", doc["in_force"])
+check("...and effective.json acknowledges the request",
+      doc["host_request"]["status"] == "applied" and doc["host_request"]["in_force_w"] == 600
+      and doc["host_request"]["from"] == "heatguard" and doc["total_in_force_w"] == 600,
+      doc["host_request"])
+host_request(rdir, {"total_w": 800, "from": "heatguard"})
+run(ctl, 1, total=1e9)
+check("raised to 800: it doesn't jump back", gov.total_w == 600.0, gov.total_w)
+run(ctl, 15, total=1e9)
+check("...it walks up +50 W after 30 s", gov.total_w == 650.0, gov.total_w)
+host_request(rdir, {"total_w": 800, "from": "heatguard"})   # refreshed, as heatguard would
+run(ctl, 60, total=1e9)
+check("...to 800 and stays", gov.total_w == 800.0 and sum(limits()) <= 800.5,
+      (gov.total_w, limits()))
+host_request(rdir, {"total_w": 500, "from": "heatguard"})
+run(ctl, 1, total=1e9)
+check("lowered again (500): at once", gov.total_w == 500.0 and limits() == [250.0, 250.0],
+      (gov.total_w, limits()))
+write(state, "total", "900")
+run(ctl, 1, total=1e9)
+check("the operator moves the total meanwhile: taken (900), the request still holds 500",
+      gov.operator_total_w == 900.0 and gov.total_w == 500.0, (gov.operator_total_w, gov.total_w))
+CLOCK.advance(nfc.HOST_REQUEST_MAX_AGE_S + 1)
+run(ctl, 1, total=1e9)
+doc = effective(ctl)
+check("not refreshed for 2 min: the request is stale and ignored (a dead heatguard can't "
+      "hold power down)", doc["host_request"]["status"] == "stale" and gov.host_request_w is None,
+      doc["host_request"])
+run(ctl, 8 * 15 + 2, total=1e9)
+check("...and the total walks back to the operator's 900 W, then the request is gone",
+      gov.total_w == 900.0 and gov.host_bound_w is None, (gov.total_w, gov.host_bound_w))
+
+for bad, why in (("{bad json", "not JSON"), ('{"total_w": "lots"}', "not watts"),
+                 ('{"total_w": 0}', "zero"), ("[400]", "not an object")):
+    ctl, gov, store, state, rdir = rig(saved={"ceiling": "600", "total": "1000"})
+    host_request(rdir, bad)
+    run(ctl, 1, total=1e9)
+    check(f"a malformed host request ({why}) is ignored",
+          gov.total_w == 1000.0 and effective(ctl)["host_request"]["status"] == "malformed",
+          (gov.total_w, effective(ctl)["host_request"]))
+ctl, gov, store, state, rdir = rig(saved={"ceiling": "600", "total": "1000"})
+host_request(rdir, "")
+run(ctl, 1, total=1e9)
+check("an empty host request file means no request",
+      gov.total_w == 1000.0 and effective(ctl)["host_request"] is None,
+      effective(ctl).get("host_request"))
+host_request(rdir, {"total_w": 100, "from": "heatguard"})
+run(ctl, 1, total=1e9)
+check("a request below the GPUs' minimum holds them at it (2 x 150 W)",
+      gov.total_w == 300.0, gov.total_w)
+check("--clear-override leaves the host request alone",
+      "host-request" not in nfc.clear_overrides(rdir)
+      and os.path.exists(os.path.join(rdir, nfc.HOST_REQUEST_FILE)))
+
+# no operator total: the request becomes the total, and lifting it walks back to no total
+ctl, gov, store, state, rdir = rig(saved={"ceiling": "600"})
+busy_cards(True, True)
+host_request(rdir, {"total_w": 700, "from": "heatguard"})
+run(ctl, 1, total=1e9)
+check("no operator total: the request is the total (700 W)",
+      gov.total_w == 700.0 and sum(limits()) <= 700.5, (gov.total_w, limits()))
+os.remove(os.path.join(rdir, nfc.HOST_REQUEST_FILE))
+run(ctl, 11 * 15 + 2, total=1e9)
+check("...removed: it walks up to the ceilings' 1200 W, then there's no total again",
+      gov.total_w is None and gov.host_bound_w is None and limits() == [600.0, 600.0],
+      (gov.total_w, gov.host_bound_w, limits()))
+
 print("\n== recovery per card: a cool card comes back fast while the other sits near the target ==")
 ctl, gov, *_ = rig(saved={"profile": "quiet", "ceiling": "600", "target": "60"}, budget=900)
 gov.ups.read = lambda: (500.0, ("OL",))

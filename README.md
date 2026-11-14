@@ -212,6 +212,37 @@ and trims sustained load. A total below the GPUs' combined minimum (300 W) is re
 missing or unreadable, the last total stays in force**; only an explicit `none` clears it (it
 fails closed: with a 600 W ceiling, no total would mean 600/600).
 
+### Host requests (another tool asks for less GPU power)
+
+A tool on the host can ask for less GPU power without touching a limit or the operator's
+settings. heatguard does this when the board zone stays at its limit with its fans at 100%
+(owner ruling heatguard/7, 2026-11-14). It writes **`/run/nvidia-fan-control/host-request`**:
+
+```json
+{"total_w": 600, "reason": "board SYSTIN 51 °C ≥ limit 50", "from": "heatguard"}
+```
+
+- **What it means:** `total_w` caps all GPUs together, like the total ceiling. The total in
+  force is the lower of the operator's total and the request's cap. The busy cards share it,
+  as usual.
+- **Freshness:** the request counts only while the file is **fresh, rewritten within 120 s**. A
+  requester that stops refreshing, or dies, can't hold power down. Write it atomically: a temp
+  file, then a rename.
+- **Lower** applies at once. **Higher or removed:** the cap walks back up **+50 W every 30 s**,
+  so the heat it was asked to shed doesn't return in one step.
+- **Edge cases:**
+  - an absent or empty file means no request;
+  - a malformed one is logged and ignored;
+  - a request below the GPUs' minimum (150 W each) holds them at the minimum.
+- **Acknowledgements:**
+  - `effective.json` has `host_request`: `status` = applied / stale / malformed / lifted,
+    `total_w`, `from`, `reason`, `age_s`, and `in_force_w` (what's in force while it walks);
+  - `total_in_force_w` is the total actually applied;
+  - `in_force.total` stays the operator's;
+  - the journal says `POWER: host request from heatguard: all GPUs together at most 600 W (…)`.
+- **What it never touches:** the per-card ceilings, the fans or the settings files.
+  `--clear-override` leaves it alone.
+
 ### The UPS budget
 
 With `--power-budget`, the governor keeps **total** UPS load (CPU, board and disks included)

@@ -135,6 +135,15 @@ python3 /opt/nvidia-fan-control/nvidia-fan-control.py --clear-override
   nothing at all.
 - **The thermal cut hits only the hot card(s)**; the 92 °C emergency is still host-wide. With a
   total, the cooler busy cards take the share a cut card can't use.
+- **Host requests** (2026-11-14, decisions/019). Another host tool (heatguard) can cap all
+  GPUs together by writing `/run/nvidia-fan-control/host-request`,
+  `{"total_w": W, "reason": …, "from": …}`.
+  - The total in force is min(the operator's total, the request).
+  - It counts only while it's rewritten within 120 s.
+  - Lowering is at once; it walks back +50 W / 30 s.
+  - `effective.json`: `host_request`, `total_in_force_w`; `in_force.total` stays the
+    operator's.
+  - No unit, flag or setting change. The requester needs write access to the run dir.
 - **`fan-aim` sets where adaptive's fans aim** (2026-11-07, decisions/018).
   - Values: `quiet` (the default, today's quiet-first), `balanced` (target − 8 °C), `cool`
     (target − 15 °C), or °C. `none` = `quiet`.
